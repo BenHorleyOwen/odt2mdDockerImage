@@ -1,0 +1,2471 @@
+#! /usr/bin/python3
+# encoding=utf-8
+#
+# odt2html
+#
+# Copyright 2014--2024, Trinity College Computing Center
+# This file is part of Odt2html.
+#
+# Odt2html is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Odt2html is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Odt2html. If not, see <http://www.gnu.org/licenses/>.
+#
+
+#=============================================================================
+# Programmer's Notes
+#=============================================================================
+#
+# # Opendocument Standard
+# * https://www.oasis-open.org/committees/tc_home.php?wg_abbrev=office
+# * http://docs.oasis-open.org/office/v1.2/OpenDocument-v1.2-part1.html
+#
+# # Python Elementtree and LXML
+# * https://docs.python.org/2/library/xml.etree.elementtree.html
+# * http://eli.thegreenplace.net/2012/03/15/processing-xml-in-python-with-elementtree/
+# * http://lxml.de/
+# * http://lxml.de/lxmlhtml.html
+#
+# # Epub
+# * http://idpf.org/epub/201
+# * http://www.manuel-strehl.de/dev/simple_epub_ebooks_with_python.en.html
+# * https://code.google.com/p/python-epub-builder/
+#
+# # Social Networking Tags
+# * https://developers.google.com/+/web/snippet/
+# * https://developers.google.com/structured-data/testing-tool/
+#
+
+from __future__ import print_function
+import zipfile
+import sys
+import os
+import re
+import textwrap
+import uuid
+import fnmatch
+import copy
+import codecs
+import json
+from copy import deepcopy
+from rcssmin import cssmin
+from rjsmin import jsmin
+from PIL import Image
+from base64 import b64encode
+
+import lxml.etree as ET
+from lxml.builder import E
+import lxml.html
+
+# Python 2
+#from urlparse import urlparse
+#from urllib import quote, unquote
+#from urllib import url2pathname
+
+# Python 3
+from urllib.parse import urlparse
+from urllib.parse import quote, unquote
+from urllib.request import url2pathname
+
+#============================================================================
+# Container for configuration (mainly from the command line)
+#============================================================================
+
+class Odt2HtmlOptions(object):
+	debug = False						# --debug
+	output_format = "html"
+	minimize = True						# minimize CSS
+	template = None						# --template=
+	site_name = None					# --site-name=
+	site_url = None						# --site-url=
+	nav_names = []						# --nav-names=
+	indexes = []						# --index=
+	player_lib_dir = '../lib/odt2html'	# --player-lib-dir=
+	player_version = "-v14.min"
+	zoom_image_version = "-v1"
+
+	# If False, then only one HTML file will be generated.
+	# If True, then one HTML file will be generated for
+	# each top-level <text:section>.
+	split_by_sections = False
+
+	# Use data: URLs for embedded images?
+	use_data_urls = True
+
+	# If the ODT file contains a table or contents, should we keep it?
+	keep_toc = True
+
+	# 0: weight and slant, 1: generic families, 2: specific families
+	font_support_level = 1
+
+	# Convert SVG files to PNG files?
+	svg2png = False
+
+	# Should we drop styles from the ODT file which are not
+	# used in the text?
+	# FIXME: does not work correctly
+	drop_unused_styles = False
+
+	# If two styles have the same right-hand-side, keep only
+	# first one. This reduces file size, but you should not
+	# do this if you intend to edit the resulting style sheet
+	# later since styles which should represent different things
+	# will have been combined just because they look the same.
+	collapse_styles = False
+
+	# Openoffice uses unnecessarily complicated table border styles.
+	# Even though the borders of ajoining cells should collapse,
+	# it takes great care to define a border for only one of the
+	# cells.
+	simplify_table_borders = True
+
+	# Take tables which contain "Box" in their names and turn them into
+	# wrappable containers of boxes.
+	wrap_tables = True
+
+#============================================================================
+# These two classes are used to load an HTML index pages which the user may
+# choose to provide. We load this index pages so that we can create
+# backlinks in the converted documents. We also draw metadata from these
+# pages.
+#============================================================================
+
+class Odt2HtmlIndexedArticle(object):
+	def __init__(self, index, section_id, section_heading, linked_text):
+		self.index = index						# Odt2HtmlIndex object
+		self.section_id = section_id			# <section id="X">
+		self.section_heading = section_heading	# <section><h2> text
+		if u"—" in linked_text and section_id is not None:
+			self.title = linked_text.split(u"—",1)[1]
+		else:
+			self.title = linked_text
+	def __str__(self):
+		return "<Odt2HtmlIndexArticle title=\"%s\">" % self.title
+
+class Odt2HtmlIndex(dict):
+	def __init__(self, filename):
+		self.filename = filename		# HTML file from which this index was loaded
+		self.site_name = None			# FIXME: set but unused
+		self.site_url = None			# FIXME: set but unused
+		self.publisher = None
+		self.author = None
+		self.breadcrumblist = []
+
+		# Listed files will be relative to this.
+		if "/" in filename:
+			self.dirname = os.path.dirname(filename) + "/"
+		else:
+			self.dirname = ""
+
+		with open(filename) as fh:
+			index = lxml.html.parse(fh)
+
+		# Collect information about the index entry for each listed document.
+		for section in index.xpath("//section"):
+			section_id = section.attrib.get('id')
+			h2s = section.xpath("./h2")
+
+			if len(h2s) == 1:
+				section_heading = re.sub(r"\s+\(.+\)\s*$", "", h2s[0].text)		# parenthetical removed
+			else:
+				section_heading = None
+
+			for anchor in section.xpath(".//a"):
+				href = anchor.attrib.get('href')
+				if href:
+					filename = unquote(href)
+					self[filename] = Odt2HtmlIndexedArticle(self, section_id, section_heading, anchor.text_content().strip())
+
+		# Collect site metadata from the index itself.
+		for script in index.xpath("//script[@type='application/ld+json']"):
+			data = json.loads(script.text)
+			for item in data if type(data) is list else (data,):
+
+				# Save author and publisher so that we can copy it into the Article metadata.
+				if item['@type'] == "Organization":
+					self.publisher = {
+						'@type':item['@type'],
+						'name':item['name'],
+						'logo':item['logo']
+						}
+					self.author = {
+						'@type':item['@type'],
+						'name':item['name'],
+						}
+					continue
+
+				# FIXME: This is currently unused. Can it replace --site-url= and --site-name=?
+				if item['@type'] == "WebSite":
+					self.site_name = item['name']
+					self.site_url = item['url']
+					if not self.site_url.endswith("/"):
+						self.site_url += "/"
+					continue
+
+				# Unless an index page is the top page of the site it should have breadcrumbs
+				# to show where it is in the site. Save them so that we can propagate them
+				# to the indexed document.
+				if item['@type'] == "BreadcrumbList":
+					self.breadcrumblist = item['itemListElement']
+
+		if self.site_name is None and len(self.breadcrumblist) == 0:
+			print("Warning: index \"%s\" lacks Schema.org metadata" % self.filename)
+
+	def __str__(self):
+		return "<Odt2HtmlIndex filename=\"%s\", %d entries>" % (self.filename, len(self.keys()))
+
+#============================================================================
+# This does the actual conversion from ODT to HTML
+#============================================================================
+
+class Odt2Html(object):
+	def __init__(self, odt_filename, output_filename, opts=None):
+		self.odt_filename = odt_filename
+		self.opts = opts if opts else Odt2HtmlOptions()
+
+		self.output_dirname = os.path.dirname(output_filename)		# directory of output file
+		if self.output_dirname == "":
+			self.output_dirname = "."
+
+		self.td_sound = None		# speaking table cells
+		self.depth = 0				# recursion level
+		self.section_count = None	# current top-level section
+		self.subdocs_by_href = {}	# sections which represent child documents
+		self.metadata = {}
+		self.title_el = None
+		self.h1s = []				# level 1 headings
+		self.images = []			# images to include in .epub file
+		self.require_bgplay = False
+		self.require_zoom_image = False
+		self.playlist = []
+		self.topic_index_counter = 0
+		self.index_entry = None
+		self.default_language = "XX"
+		self.default_font_family = None
+
+		# Search the indexes specified with --index= options looking for
+		# a link to the converted document named in output_filename.
+		for index in self.opts.indexes:
+			search_filename = output_filename
+			#print(" index.dirname:", index.dirname)
+			#print(" search_filename:", search_filename)
+			if index.dirname != "":
+				if search_filename.startswith(index.dirname):
+					search_filename = search_filename[len(index.dirname):]
+				else:		# FIXME: this is a hack
+					search_filename = "../" + search_filename
+			self.index_entry = index.get(search_filename)
+			if self.index_entry is not None:
+				break
+
+		# Perform the conversion
+		if self.opts.output_format == "html":
+			self.load_and_convert()
+			if self.td_sound:
+				self.enable_td_sound()
+			if self.opts.wrap_tables:
+				self.wrap_tables()
+			if self.opts.site_url is not None:
+				page_url = self.opts.site_url + quote(output_filename)
+				self.add_opengraph(self.opts.site_url, page_url)
+				self.add_schema_org(self.opts.site_url, page_url)
+			self.embed_javascript()
+			self.embed_stylesheet()
+			if self.opts.template:
+				self.add_template()
+			if self.opts.minimize:
+				self.minimize()
+			self.save_html(output_filename)
+		elif self.opts.output_format == "epub":
+			self.opts.use_data_urls = False
+			self.opts.keep_toc = False
+			self.opts.split_by_sections = True
+			self.opts.use_html5 = False
+			#self.opts.svg2png = True
+			self.load_and_convert()
+			self.save_epub(output_filename)
+		else:
+			raise AssertionError("Invalid output_format: %s" % self.opts.output_format)
+
+	#------------------------------------------------------------------
+	# Load the style and content XML files into memory and create most of the
+	# output HTML document in memory.
+	#------------------------------------------------------------------
+	def load_and_convert(self, data_urls=True):
+		# Open the ODT file and show what is inside it
+		self.odt = zipfile.ZipFile(self.odt_filename)
+		if self.opts.debug:
+			print("===== ODT File Contents =====")
+			for resource_filename in self.odt.namelist():
+				print("  %s" % resource_filename)
+			print()
+
+		# Uncompress and parse the XML streams which we need.
+		meta_xml = self.load_xml("meta.xml")
+		styles_xml = self.load_xml("styles.xml")
+		content_xml = self.load_xml("content.xml")
+
+		# Parse the styles from styles.xml and content.xml
+		self.styles = OdtStyle2Css(self.opts)
+		for font_face_decls in (
+			styles_xml.xpath("/document-styles/font-face-decls")[0],
+			content_xml.xpath("/document-content/font-face-decls")[0],
+			):
+			self.styles.add_fonts(font_face_decls)
+		for stylesheet in (
+			styles_xml.xpath("/document-styles/styles")[0],				# from stylesheet UI
+			#styles_xml.xpath("/document-styles/automatic-styles")[0],	# used in master styles
+			content_xml.xpath("/document-content/automatic-styles")[0]	# from element format UI
+			):
+			self.styles.add_stylesheet(stylesheet)
+
+		# Create HTML objects into which we can start
+		# to insert objects to represent the output document
+		self.html_head = E.head()
+		self.html_head.append(E.meta({"http-equiv":"content-type","content":"text/html; charset=utf-8"}))
+		self.html_body = E.body()
+
+		# Search for the title of the document. Priority:
+		# 1) Metadata
+		# 2) Contents of level 1 heading
+		titles = meta_xml.xpath("/document-meta/meta/title")
+		if len(titles) > 0 and titles[0].text is not None:
+			self.metadata['title'] = titles[0].text
+		else:
+			headings = content_xml.xpath("/document-content/body/text//h")
+			if len(headings) > 0:
+				self.metadata['title'] = self.element_extract_text(headings[0])
+		if not 'title' in self.metadata:
+			raise OdfNotSupported("No document title")
+		self.title_el = E.title(self.metadata['title'])
+		self.html_head.append(self.title_el)
+
+		# Search for the description of the document
+		subjects = meta_xml.xpath("/document-meta/meta/subject")
+		if len(subjects) > 0 and subjects[0].text is not None:
+			self.metadata['description'] = subjects[0].text
+			self.html_head.append(E.meta({'name':'description','content':self.metadata['description']}))
+
+		# Search for the keywords of the document
+		keywords = meta_xml.xpath("/document-meta/meta/keyword")
+		if len(keywords) > 0:
+			self.html_head.append(E.meta({'name':'keywords','content':",".join(map(lambda keyword: keyword.text, keywords))}))
+
+		# Look for odt2html configuration items in the document user data.
+		for variable in meta_xml.xpath("/document-meta/meta/user-defined"):
+			name = variable.attrib.get("name")
+			if name == "TD Sound":
+				self.td_sound = variable.text
+			else:
+				self.metadata[name] = variable.text
+
+		# Get a pointer to the ODT document body.
+		odt_body = content_xml.xpath("/document-content/body/text")[0]
+
+		# Pass 1
+		self.section_count = 0
+		for odt_el in odt_body:
+			self.scan_element(odt_el)
+
+		# Pass 2: convert the document and append it to the HTML body
+		self.section_count = 0
+		for odt_el in odt_body:
+			self.convert_element(odt_el, self.html_body, None)		# calls self recursively
+
+		# Convert the footer and add it to the body
+		odt_footer = styles_xml.xpath("/document-styles/master-styles/master-page[@name='Standard']/footer/p")
+		if len(odt_footer) >= 1:
+			html_footer = E.div({"class":"footer"})
+			self.convert_element(odt_footer[0], html_footer, None)
+			self.html_body.append(E.footer(html_footer))
+
+		# Do post-processing on table cells.
+		for td in self.html_body.xpath(".//td"):
+
+			# Table cells should not have text directly inside them (yet).
+			assert td.text is None, "unexpected text: \"%s\"" % td.text
+
+			# Nor should they have trailing text
+			assert td.tail is None, "unexpected tail: \"%s\"" % td.tail
+
+ 			# If this <td> contains a single paragraph, subsume it.
+			if len(td) == 1 and td[0].tag == "p" \
+				and not self.styles.test(td[0].attrib.get("class"), "margin*") \
+				and not self.styles.test(td[0].attrib.get("class"), "border"):
+				p = td[0]
+				classes = []
+				if "class" in td.attrib:
+					classes.append(td.attrib["class"])
+				if "class" in p.attrib:
+					classes.append(p.attrib["class"])
+				if len(classes) > 0:
+					td.attrib["class"] = " ".join(classes)
+				if "lang" in p.attrib:
+					td.attrib["lang"] = p.attrib["lang"]
+				td.text = p.text
+				for child in p:
+					td.append(child)
+				td.remove(p)
+				if td.text is None or len(td.text) < 25:		# unwrap short <td>'s
+					td.tail = ""
+
+		# Hoist elements out of their parents where they have requested it.
+		for el in self.html_body.xpath(".//*[@hoist='true']"):
+			parent = el.getparent()
+			grandparent = parent.getparent()
+			grandparent.insert(grandparent.index(parent), el)
+			if el.tail:
+				if parent.text is None:		# FIXME: could there be a previous child which should get the text added to its tail?
+					parent.text = ""
+				parent.text += el.tail
+				el.tail = None
+			del el.attrib["hoist"]
+
+		# Hoist the note links out of the note container and move the note bodies
+		# to an unordered list at the end of the document.
+		notes = list(self.html_body.xpath(".//li[@class='note']"))
+		if len(notes) > 0:
+			notes_ul = E.ul({"class":"notes"})
+			for note in notes:
+				note_citation = note.xpath("./div[@class='note-citation']")[0]
+				note_body = note.xpath("./div[@class='note-body']")[0]
+				a = deepcopy(note_citation)
+				a.tag = "a"
+				a.attrib["href"] = "#" + note.attrib["id"]
+				a.tail = note.tail
+				note.tail = None
+				parent = note.getparent()
+				parent.insert(parent.index(note), a)
+				notes_ul.append(note)
+			self.html_body.append(notes_ul)
+
+	#------------------------------------------------------------------
+	# Load one of the XML files embedded in the ODT file
+	#------------------------------------------------------------------
+	def load_xml(self, filename):
+		if self.opts.debug:
+			print("===== %s =====" % filename)
+
+		tree = ET.parse(self.odt.open(filename))
+
+		# Strip namespace URIs from tag and attribute names
+		for el in tree.iter():
+			if isinstance(el, ET._Comment):
+				continue
+			el.tag = el.tag.split("}")[1]
+			for name, value in el.attrib.items():
+				short_name = name.split("}")[1]
+				del el.attrib[name]
+				el.attrib[short_name] = value
+
+		if self.opts.debug:
+			print(ET.tostring(tree, pretty_print=True, encoding="unicode"))
+
+		return tree
+
+	#------------------------------------------------------------------
+	# Pass 1
+	#------------------------------------------------------------------
+
+	def scan_element(self, odt_el):
+		# Collect the source file names of the subdocuments of a master document.
+		# We need this information in order to resolve links between subdocuments.
+		if odt_el.tag == "section":
+			section_id = self.get_section_id(odt_el)
+			subdoc_href = self.get_section_source_href(odt_el)
+			if subdoc_href is not None:
+				self.subdocs_by_href[subdoc_href] = section_id
+
+	def get_section_id(self, odt_el):
+		self.section_count += 1
+		if "name" in odt_el.attrib:
+			return odt_el.attrib["name"].replace(" ","_")
+		else:
+			return "topsect%d" % self.section_count
+
+	# If this section encloses a subdocument of a master document, return an
+	# href to the subdocument with the extension changed to ".html".
+	def get_section_source_href(self, odt_el):
+		if odt_el.attrib.get("protected","false") != "true":
+			return None
+		section_sources = odt_el.xpath("./section-source")
+		if len(section_sources) == 0:
+			return None
+		if len(section_sources) != 1:
+			raise OdfInvalid("%d <section-source> elements" % len(section_sources))
+		href = section_sources[0].attrib["href"]
+		return self.href_to_html(href)
+
+	#------------------------------------------------------------------
+	# Pass 2
+	#------------------------------------------------------------------
+
+	# This function converts an ODT element to HTML and adds it to the
+	# parent HTML element specified. It then calls itself on each child
+	# of the ODT element with the newly created HTML element as the
+	# target parent.
+	def convert_element(self, odt_el, html_parent_el, list_style_name):
+
+		convert_children = True					# call self recursively on children
+
+		style_name = odt_el.attrib.get("style-name")
+
+		if odt_el.tag == "sequence-decls":		# mystery
+			html_el = None
+		elif odt_el.tag == "section":
+			if self.opts.debug:
+				print("  Section:", odt_el.attrib.get("name"))
+			html_el = E.div()
+			if self.depth == 0:					# if at master document level
+				section_id = self.get_section_id(odt_el)
+				subdoc_href = self.get_section_source_href(odt_el)
+				if subdoc_href:					# if this is a child of a master document,
+					if self.section_count != self.subdocs_by_href[subdoc_href] != subdoc_id:
+						raise OdfInvalid("Master document inconsistency")
+				html_el.attrib["id"] = section_id
+			else:
+				html_el.attrib["id"] = odt_el.attrib["name"].replace(" ","_")
+		elif odt_el.tag == "section-source":	# handled during pass 1
+			html_el = None
+		elif odt_el.tag == "h":
+			if self.opts.debug:
+				print("Heading:", self.element_extract_text(odt_el), style_name)
+			level = int(odt_el.attrib["outline-level"])
+			html_el = E("h%d" % level)
+			if level == 1:	# level 1 headings have ID's
+
+				if style_name and style_name.startswith("P"):
+					print("  Warning: level 1 heading with paragraph style: %s" % style_name)
+
+				bookmarks = odt_el.xpath("./bookmark-start")
+				if len(bookmarks) > 0:
+					h_id = bookmarks[0].attrib["name"]
+				else:
+					h_id = "subh%d" % (len(self.h1s) + 1)
+				h_filename = "content%d.html" % self.section_count
+				h_text = self.element_extract_text(odt_el)
+				html_el.attrib["id"] = h_id
+				self.h1s.append((h_filename, h_id, h_text))
+		elif odt_el.tag == "bookmark":
+			html_el = E.span({"dropme":odt_el.tag})
+		elif odt_el.tag == "bookmark-start":
+			html_el = E.span({"dropme":odt_el.tag})
+		elif odt_el.tag == "bookmark-end":
+			html_el = E.span({"dropme":odt_el.tag})
+
+		elif odt_el.tag == "p":					# paragraph
+			# If this paragraph is the first one inside an <LI> tag, put everything
+			# inside the <LI> instead since otherwise if the paragraph is indented
+			# it will move away from the bullet.
+			# FIXME: Does this have something to do with the style rule:
+			#        LI, P { position: relative }
+			if html_parent_el.tag == "li" and self.element_empty(html_parent_el):
+				html_el = html_parent_el
+			else:
+				html_el = E.p()
+		elif odt_el.tag == "span":				# text format
+			html_el = E.span()
+			html_el.tail = ""					# <-- prevents newline with pretty_print=True
+		elif odt_el.tag == "a":
+			html_el = self.convert_hyperlink(odt_el)
+		elif odt_el.tag == "line-break":
+			html_el = E.br()
+		elif odt_el.tag == "soft-page-break":	# FIXME: read up on this
+			html_el = ET.Comment("soft-page-break")
+		elif odt_el.tag == "tab":
+			if len(odt_el) != 0:
+				raise OdfInvalid("<tab> should not have children")
+			html_el = E.span({"class":"tab"})
+			html_el.text = 8 * u" "				# eight non-breaking spaces
+		elif odt_el.tag == "s":					# spaces
+			if len(odt_el) != 0:
+				raise OdfInvalid("<s> should not have children")
+			count = int(odt_el.attrib.get("c","1"))
+			if count == 1:
+				html_el = E.span({"dropme":"s"})
+				html_el.text = " "
+			else:
+				html_el = E.span({"class":"space"})
+				count = int(count * 1.15)		# 1.15 is fudge
+				html_el.text = count * " "
+		elif odt_el.tag == "frame":
+			html_el = self.convert_frame(odt_el)
+			if html_el.tag == "img":			# if simplified to <img>,
+				convert_children = False
+		elif odt_el.tag == "text-box":
+			html_el = E.div()
+		elif odt_el.tag == "page-number":		# FIXME: what about the content (which is an actual page number)?
+			html_el = ET.Comment("page-number")
+
+		elif odt_el.tag == "table":
+			html_el = E.table()
+		elif odt_el.tag == "table-column":
+			html_el = E.col()
+		elif odt_el.tag == "table-header-rows":
+			html_el = E.thead()
+		elif odt_el.tag == "table-row":
+			html_el = E.tr()
+		elif odt_el.tag == "table-cell":
+			html_el = E.td()
+			if "number-rows-spanned" in odt_el.attrib:
+				html_el.attrib["rowspan"] = odt_el.attrib["number-rows-spanned"]
+			if "number-columns-spanned" in odt_el.attrib:
+				html_el.attrib["colspan"] = odt_el.attrib["number-columns-spanned"]
+			if not self.styles.style_still_exists(style_name):	# if simplified away,
+				style_name = None
+		elif odt_el.tag == "covered-table-cell":
+			html_el = None						# don't convert
+
+		elif odt_el.tag == "list":
+			if style_name:
+				list_style_name = style_name
+			if self.styles.styles_byname[list_style_name].tag == "OL":
+				html_el = E.ol()
+			else:
+				html_el = E.ul()
+		elif odt_el.tag == "list-header":
+			raise OdfNotImplementedYet("list-header")
+		elif odt_el.tag == "list-item":
+			html_el = E.li()
+
+		elif odt_el.tag == "table-of-content":
+			if self.opts.keep_toc:
+				html_el = E.div({"id":"toc"})
+			else:
+				html_el = None					# don't convert
+		elif odt_el.tag == "table-of-content-source":
+			html_el = None
+
+		elif odt_el.tag == "alphabetical-index":
+			html_el = E.div({"id":"index"})
+		elif odt_el.tag == "alphabetical-index-source":
+			html_el = None
+
+		elif odt_el.tag == "alphabetical-index-mark":			# zero width index entry mark
+			#print("  Index mark:", str(odt_el.attrib), odt_el.tail)
+			html_el = self.convert_index_mark(odt_el)
+		elif odt_el.tag == "alphabetical-index-mark-start":		# start of index entry span
+			#print("  Index mark start:", str(odt_el.attrib), odt_el.tail)
+			html_el = self.convert_index_mark(odt_el)
+		elif odt_el.tag == "alphabetical-index-mark-end":		# end of entry span
+			html_el = E.span({"dropme":odt_el.tag})
+
+		elif odt_el.tag == "index-body":
+			html_el = E.div()
+		elif odt_el.tag == "index-title":
+			html_el = E.div()
+
+		elif odt_el.tag == "user-defined":
+			html_el = E.span({"class":"user-defined"})		# class is not used
+		elif odt_el.tag == "variable-decls":
+			html_el = None	# drop children too
+		elif odt_el.tag == "variable-set":
+			html_el = E.span({"dropme":odt_el.tag})
+		elif odt_el.tag == "annotation":		# user note
+			html_el = None
+
+		# Forms not really implemented. All we do is draw a box for each control.
+		elif odt_el.tag == "forms":
+			html_el = None
+		elif odt_el.tag == "control":
+			html_el = E.span(
+				{"style":"border: thin solid black;display:inline-block;width:100%%;max-width:%s;height:%s" % (
+					odt_el.attrib["width"],
+					odt_el.attrib["height"]
+					)}
+				)
+
+		# Turn footnotes into LI tags. We later move them to a UL at the end of
+		# the document leaving an A tag in the place of each.
+		# FIXME: Handling of footnote style is a hack
+		elif odt_el.tag.startswith("note"):
+			print(f"{odt_el.tag}: {odt_el.attrib}")
+			if odt_el.tag == "note":
+				html_el = E.li({"id": odt_el.attrib["id"], "class":"note"})
+			elif odt_el.tag == "note-citation":
+				html_el = E.div({"class":"note-citation"})
+			elif odt_el.tag == "note-body":
+				html_el = E.div({"class":"note-body"})
+
+		# Unimplemented ODF tag
+		else:
+			#print("  Warning: unimplemented tag: %s" % odt_el.tag)
+			#html_el = E.span()
+			raise OdfNotImplementedYet("unimplemented tag: %s" % odt_el.tag)
+
+		# If we converted the ODF element to an HTML element
+		# (rather than simply dropping it),
+		if html_el is not None:
+			if odt_el.text is not None:				# transfer text within tags
+				html_el.text = odt_el.text
+			if odt_el.tail is not None:				# transfer text after closing tag
+				html_el.tail = odt_el.tail
+
+			if style_name is not None:
+				classname, language = self.styles.claim_style(style_name)
+				if classname is not None:
+					html_el.attrib["class"] = classname
+				if language is not None:
+					html_el.attrib["lang"] = language
+				if self.styles.get_break_before(style_name) == "page":
+					# This element should appear at the top of a new page.
+					if len(self.html_body) > 0 or len(html_parent_el) > 0:		# if not at top of first page,
+						if len(html_parent_el):									# if parent already has content
+							html_parent_el.append(E.hr({"class":"pagebreak"}))
+						else:													# otherwise, try to get it above parent
+							self.html_body.append(E.hr({"class":"pagebreak"}))
+
+			if convert_children:
+				# Call the current function recursively to convert the ODT tag's children.
+				for child in odt_el:
+					self.depth += 1
+					self.convert_element(child, html_el, list_style_name)
+					self.depth -= 1
+
+				# Now run through the children collapsing the unnecessary spans
+				# which Google Docs creates for no appearent reason.
+				prev_child = None
+				for child in html_el:
+					#print(child, child.text, child.tail, child.attrib)
+
+					if prev_child is not None \
+							and child.tag == "span" and prev_child.tag == "span" \
+							and child.attrib == prev_child.attrib \
+							and prev_child.text is not None \
+							and (prev_child.tail is None or prev_child.tail == "") \
+							and len(prev_child) == 0 and len(child) == 0:
+						#print("collapsed")
+						if child.text is not None:
+							prev_child.text += child.text
+						if child.tail is not None:
+							prev_child.tail = child.tail
+						html_el.remove(child)
+
+					else:
+						prev_child = child
+
+				# Look for weird stuff with stress marks. We have seen ODT files with
+				# tags between the character and the stress mark. Since the stress mark
+				# is a combining character, this is an error. This may be a problem with
+				# the handling of spans created to set the language.
+				# We have to detect this problem since iPad browsers will not render
+				# this erroneous sequence as the user intended.
+				# We expect the user to fix the document by doing the following:
+				# * open the document
+				# * select the offending text with the stress mark
+				# * note it says "Multiple Langauges" in status bar at the bottom of the window
+				# * select the correct language
+				# * save the document
+				for child in html_el:
+					if child.tag == "span":
+						if child.text == u"\u0301":
+							raise OdfBadFormatting("Spurious stress mark span")
+						if child.tail and child.tail.startswith(u"\u0301"):
+							raise OdfBadFormatting("Combining stress mark between spans")
+
+			# If this is a <p> tag, examine it now that its children (if any)
+			# have been converted. If it is completely empty, put a <BR> tag
+			# into it because in HTML 4 empty <P> tags are supposed to be ignored.
+			if odt_el.tag == "p" and self.element_empty(html_el):
+				#html_el = E.br()
+				html_el.append(E.br())
+
+			# If conversion yielded a <table> tag, perform more processing now
+			# that its children have been converted.
+			if html_el.tag == "table":
+				# Create a <tbody> and move the non-header rows into it.
+				# We have to do this to pass XHTML 1.1 validation.
+				tbody = E.tbody()
+				for child in list(html_el):
+					if child.tag == "tr":
+						html_el.remove(child)
+						tbody.append(child)
+				html_el.append(tbody)
+
+				# Wrap the <table> in a <div> since this seems the only way we can
+				# restrict its width on all browsers.
+				restraint = E.div(html_el, {'class':'restrain'})
+
+				# If the previous element is <h*>, then wrap it and the wrapper <div>
+				# in still another wrapper <div> so that 'clear: both' will push them
+				# both down.
+				if len(html_parent_el) >= 1:
+					sibling = html_parent_el[-1]
+					if sibling.tag.startswith("h"):			# FIXME: use regexp
+						html_parent_el.remove(sibling)
+						restraint = E.div(sibling, restraint)
+
+				# If "clear: both" is set in the table's style, set it in the wrapper DIV too.
+				if self.styles._by_css_class(html_el.attrib['class']).properties.get('clear') == 'both':
+					restraint.attrib['style'] = 'clear: both'
+
+				html_el = restraint
+
+			# There are some empty ODF tags which we want to ignore, but we
+			# cannot ignore them completely because they can come inside runs
+			# of text and we do not want to lose their tail text. Here we
+			# merge their text and tail text into either the parent element or the
+			# previous sibling element and then drop them.
+			if "dropme" in html_el.attrib:
+				if len(html_el) > 0:
+					raise OdfInvalid("<%s> tag not empty" % html_el.attrib["dropme"])
+				text = ""
+				if html_el.text is not None:
+					text += html_el.text
+				if html_el.tail is not None:
+					text += html_el.tail
+				if text != "":
+					if len(html_parent_el) == 0:
+						if html_parent_el.text is None:
+							html_parent_el.text = ""
+						html_parent_el.text += text
+					else:
+						prev_el = html_parent_el[-1]
+						if prev_el.tail is None:
+							prev_el.tail = ""
+						prev_el.tail += text
+
+			# If we haven't dropped this tag in the previous code block and we
+			# have not subsuming it into its parent, add it to its parent.
+			elif html_el != html_parent_el:
+				html_parent_el.append(html_el)
+				# Table columns and cells can be repeated
+				for i in range(int(odt_el.attrib.get('number-columns-repeated', 1)) - 1):
+					html_parent_el.append(copy.deepcopy(html_el))
+
+		return
+
+	# Called from convert_element() when it encounters an <a> tag
+	def convert_hyperlink(self, odt_el):
+		assert odt_el.tag == 'a'
+		href = odt_el.attrib["href"]
+		target = odt_el.attrib.get("target-frame-name")
+
+		if target == "player":
+			html_el = self.convert_player(odt_el, href)
+		else:
+			#print("  href: %s" % href)
+			if href.startswith("http:"):				# Internet link
+				pass
+			elif href.startswith("https:"):				# Internet link
+				pass
+			elif href.startswith("ftp:"):				# Internet link
+				pass
+			elif href.startswith("../"):				# Intrasite link relative to zip root (but outside)
+				href_html = self.href_to_html(href)		# convert extension
+				if href_html in self.subdocs_by_href:	# in same master document?
+					if self.opts.split_by_sections:
+						href = "content%s.html" % self.subdocs_by_href[href_html]
+					else:
+						href = "#%s" % self.subdocs_by_href[href_html]
+				else:
+					# Make sure target file (likely an ODT or HTML file) exists
+					fs_path = os.path.join(os.path.dirname(self.odt_filename), url2pathname(href[3:]))
+					fs_path = fs_path.encode("utf-8")	# FIXME: assumes file system encoding is UTF-8
+					if not os.path.exists(fs_path):
+						print("  Warning: broken link: %s" % fs_path)
+					# Whether it exists or not, point to the HTML version
+					href = href_html[3:]
+			elif href.startswith("#zoom_image"):
+				self.require_zoom_image = True
+			elif href.startswith("#"):					# Intradocument link
+				pass
+			else:
+				raise OdfNotImplementedYet("href of unimplemented type: %s" % href)
+
+			html_el = E.a({"href":href})
+			if target is not None:
+				html_el.attrib['target'] = target
+			if href.endswith(".svg"):					# FIXME: not sure we need this long-term
+				html_el.attrib['type'] = "image/svg+xml"
+			if "name" in odt_el.attrib:
+				html_el.attrib['title'] = odt_el.attrib['name']
+
+		html_el.tail = ""
+		return html_el
+
+	# We provide a special hyperlink target called "player" which plays an audio
+	# or video file in a popup player. This target type is our own invention but
+	# it is compatible with the ODF specification.
+	def convert_player(self, odt_el, href):
+		if self.opts.debug:
+			print("Player:", href)
+
+		# If the href begins with "../", it points to a local file outside
+		# the ODF file. Such hrefs are described as a "Document" links in
+		# the Libreoffice GUI. The ".." reprents a move up from inside the
+		# ZIP file.
+		if href.startswith("../"):
+
+			# drop "../", remove URL quoting to get unicode
+			filename = unquote(href[3:])
+
+			# FIXME: how exactly does this work?
+			path_from_cwd = os.path.join(self.output_dirname, filename)
+
+			# If it is a JSON files, we assume it is a media manifest file such as
+			# created by our odt2html-media-manifest tool.
+			if os.path.splitext(filename)[1].lower() == ".json":
+				if self.opts.debug:
+					print("  Play from a pre-generated media manifest")
+				with open(path_from_cwd) as f:
+					manifest = json.load(f)
+				manifest['basedir'] = quote(os.path.dirname(filename))
+				if not ("audio" in manifest or "video" in manifest):
+					raise OdfBadPlayer("Media manifest %s is empty" % path_from_cwd)
+
+			# Otherwise is is presumably a bare media file. We will create
+			# a minimimal manifest for it.
+			else:
+				if self.opts.debug:
+					print("  Play a single local file")
+				mediatype, mimetype = self.filetype_from_filename(filename)
+				manifest = {
+					'basedir': quote(os.path.dirname(filename)),
+					'title': self.element_extract_text(odt_el),
+					mediatype: [
+						{
+						'mimetype': mimetype,
+						'src': quote(os.path.basename(filename)),
+						'filesize': os.path.getsize(path_from_cwd),
+						'aspect_ratio': '4:3'
+						}]
+					}
+
+		# Link to Youtube video
+		elif "www.youtube.com/watch?v=" in href:
+			if self.opts.debug:
+				print("  Play a video on Youtube")
+
+			# Extract Youtube video ID from the URL
+			m = re.search(r'v=(.+)$', href)
+			if not m:
+				raise OdfBadPlayer("Failed to parse Youtube link")
+
+			manifest = {
+				'title': self.element_extract_text(odt_el),
+				'youtube': m.group(1)
+				}
+
+		# Other "Internet" link
+		elif re.search(r"^https?:", href, re.I):
+			if self.opts.debug:
+				print("  Media is in a remote file")
+
+			mediatype, mimetype = self.filetype_from_url(href)
+			manifest = {
+				mediatype: [
+					{
+					'mimetype': mimetype,
+					'src': href,
+					}]
+				}
+
+		# Some other kind of link
+		else:
+			raise OdfBadPlayer("Unsupported URL: %s" % filename)
+
+		# If the name attribute of the link tag is in the format "PlayX",
+		# there ought to be a corresponding ODF section named "TextX". Save
+		# the "X" part so that the player can move a hightlighter through
+		# the text as the recording plays.
+		link_name = odt_el.attrib.get("name")
+		if link_name and link_name.startswith("Play"):
+			manifest["player_id"] = link_name[4:]
+
+		# Manifest is finished.
+		if self.opts.debug:
+			for line in json.dumps(manifest, indent=2, separators=(",",":"), ensure_ascii=False).split("\n"):
+				print("  %s" % line)
+
+		# Create the <A> element. It identifies the recording by playlist index number.
+		# As soon as we have done that we add the recording to the playlist.
+		# Order is important here!
+		html_el = E.a({
+			"class":"play_link",
+			"href":"javascript:play(%d)" % len(self.playlist)
+			})
+		if "title" in manifest:
+			html_el.attrib["title"] = manifest["title"]
+		self.playlist.append(manifest)
+
+		return html_el
+
+	# File types supported by our embedded player
+	playable_file_extensions = {
+		".mp3": ("audio", "audio/mpeg"),
+		".ogg": ("audio", "audio/ogg"),
+		".mp4": ("video", "video/mp4"),
+		".webm": ("video", "video/webm")
+		}
+
+	def filetype_from_filename(self, filename):
+		ext = os.path.splitext(filename)[1].lower()
+		return file_extensions[ext]
+		return self.filetype_from_ext(ext, filename)
+
+	def filetype_from_url(self, url):
+		path = urlparse(url).path
+		ext = os.path.splitext(path)[1].lower()
+		return self.filetype_from_ext(ext, url)
+
+	def filetype_from_ext(self, ext, url):
+		if ext == '':
+			raise AssertionError("Filename has no extension: %s" % url)
+		if not ext in self.playable_file_extensions:
+			raise AssertionError("Extension %s not supported by player: %s" % url)
+		return self.playable_file_extensions[ext]
+
+	# Marks alphabetical index entry
+	def convert_index_mark(self, odt_el):
+		assert odt_el.text is None
+		term = odt_el.attrib.get("string-value")
+		if term is None:
+			term = ""
+			if odt_el.tail is not None:
+				term += odt_el.tail
+			el = odt_el.getnext()
+			while el is not None and el.tag != "alphabetical-index-mark-end":
+				term += self.element_extract_text(el)
+				el = el.getnext()
+		values = []
+		for value in (odt_el.attrib.get('key1'), odt_el.attrib.get('key2'), term):
+			if value is not None:
+				values.append(value)
+		html_el = E.span({'id':"idx%02d" % self.topic_index_counter, 'data-index':json.dumps(values,separators=(',', ':'))})
+		self.topic_index_counter += 1
+		html_el.text = odt_el.tail
+		odt_el.tail = None				# so it will not be copied to html_el.tail
+		return html_el
+
+	# This is broken out as a function because convert_element() was getting too long.
+	# If a frame contains an image, convert it to an <img>, otherwise
+	# convert it to a <div>.
+	def convert_frame(self, odt_frame):
+
+		# A container for an image
+		odt_images = odt_frame.xpath("./image")
+		if len(odt_images) > 0:
+			href = odt_images[0].attrib['href']
+			html_el = E.img({"src": self.add_image(href)})
+			titles = odt_frame.xpath("./title")
+			if len(titles) > 0:
+				html_el.attrib["alt"] = titles[0].text
+			else:
+				print("  Warning: image without alt text")
+
+
+		# an actual frame
+		else:
+			name = odt_frame.attrib["name"]
+			if name in self.opts.nav_names:
+				html_el = E.nav()
+			else:
+				html_el = E.div()
+			html_el.attrib["id"] = name
+
+			# Frames anchored to paragraphs must be hoisted out of them if we
+			# are to produce valid HTML.
+			if odt_frame.attrib.get("anchor-type") == "paragraph":
+				html_el.attrib["hoist"] = "true"
+
+		# Convert the frame's style attributes
+		style = []
+		for attrib in ("width", "height", "min-width", "min-height", "max-width", "max-height"):
+			if attrib in odt_frame.attrib:
+				style.append("%s:%s" % (attrib, odt_frame.attrib[attrib]))
+
+		if "x" in odt_frame.attrib:
+			style.append("margin-left:%s" % odt_frame.attrib["x"])
+
+		html_el.attrib["style"] = ";".join(style)
+
+		return html_el
+
+	# This in turn was broken out of convert_frame() because it was getting to long.
+	# Request the addition of an image to the output document.
+	# Returns either a data: URL or the path which the image
+	# will occupy in the output file tree.
+	def add_image(self, filename):
+		image = Odt2HtmlImage(self.odt, filename, self.opts.svg2png)
+
+		if self.opts.use_data_urls:
+			# http://www.websiteoptimization.com/speed/tweak/inline-images/
+			image_data = image.get_data(pretty_print=False)
+			#print("  Data URL for %s: %d bytes" % (image.filename, len(image_data)))
+			#return "data:%s;base64,%s" % (image.mimetype, image_data.encode("base64"))
+			return "data:%s;base64,%s" % (image.mimetype, b64encode(image_data).decode("ascii"))
+		else:
+			self.images.append(image)
+			return image.filename
+
+	#------------------------------------------------------------------
+	# Post processing of generated HTML
+	#------------------------------------------------------------------
+
+	# Embed required Javascript resources
+	def embed_javascript(self):
+
+		# If there are links to audio and video files to be played in our popup
+		# player, write the list of these files out as a JavaScript variable.
+		if len(self.playlist):
+
+			# Player IDs connect players with sections of text with a moving highlight.
+			# Delete presumed player IDs which do not match such a section.
+			for item in self.playlist:
+				if "player_id" in item and not self.html_body.xpath(".//div[@id='Text%s']" % item["player_id"]):
+					del item["player_id"]
+
+			script = E.script(
+				{"type":"text/javascript"},
+				"\nvar playlist=" + json.dumps(self.playlist, indent=1, separators=(',',':'), ensure_ascii=False) + ";\n"
+				)
+			script.tail = "\n"
+			self.html_head.append(script)
+
+		# If there are "speaking table cells", insert the code for the player inline.
+		if self.require_bgplay:
+			script = E.script({"type":"text/javascript"},
+				"""
+				if(!window.analytics) window.analytics = function() {};
+				function bgplay(url) {
+					if(!bgplay.has_ogg)
+						url = url.replace(".ogg", ".mp3");
+					bgplay.player.src = url;
+					bgplay.player.play();
+					analytics('TD Sound', 'play', url);
+				}
+				bgplay.player = new Audio();
+				bgplay.has_ogg = bgplay.player.canPlayType("audio/ogg; codecs=vorbis")
+				""".replace("\n\t\t\t\t","\n")
+				)
+			script.tail = "\n"
+			self.html_head.append(script)
+
+		# If there are links to audio and video files to be played in our popup
+		# player, load the popup player.
+		if len(self.playlist):
+			script = E.script({
+				"type":"text/javascript",
+				"src":"%s/player%s.js" % (self.opts.player_lib_dir, self.opts.player_version),
+				"defer":"defer"
+				})
+			script.tail = "\n"
+			self.html_head.append(script)
+
+		# If we have any images with zooming enabled,
+		if self.require_zoom_image:
+			script = E.script({
+				'type':'text/javascript',
+				'src':'%s/zoom_image%s.js' % (self.opts.player_lib_dir, self.opts.zoom_image_version),
+				'defer':'defer'
+				})
+			script.tail = "\n"
+			self.html_head.append(script)
+
+
+	# Embed the CSS stylesheets in the document <head>
+	def embed_stylesheet(self):
+
+		# Style is responsive
+		self.html_head.append(E.meta({"name":"viewport","content":"width=device-width,initial-scale=1"}))
+
+		if self.opts.font_support_level >= 3 and self.styles.default_font_family is not None:
+			font_family = "'{font_family}',serif".format(font_family=self.styles.default_font_family)
+		else:
+			font_family = "serif"
+
+		# The base stylesheet for web browers
+		self.add_css("""
+			HTML,BODY,H1,H2,H3,H4,H4,P,OL,UL,LI { margin:0; padding:0 }
+			BODY { font-family: {{FONT_FAMILY}}; font-size:12pt }
+			H1,H2,H3,H4,H4 { font-size: inherit }
+			UL,OL { list-style-position: outside }
+			LI,P { position: relative }
+			DIV.restrain { max-width: 100%; overflow-x: auto }
+			TABLE { border-collapse: collapse }
+			TH,TD { vertical-align: top }
+			DIV.wrap { display: flex; flex-flow: row wrap }
+			DIV.wrap DIV { display: inline-block; margin: 1px; display: flex; flex-direction: column }
+			HR.pagebreak { margin: 0.5in }
+			SPAN.space { white-space: pre-wrap }
+			DIV.footer { margin-top: 0.2in; font-size: 8pt; white-space: nowrap; max-width: 100%; overflow: hidden }
+			A.note-citation { font-size: .85em; vertical-align: super }
+			UL.notes { list-style-type: none }
+			UL.notes LI { display: flex; margin: .2em 0 }
+			DIV.note-citation { width: 2rem; flex-shrink: 0 }
+			DIV.note-body > * { text-indent: 0; margin-left: 0 } !important
+			@media print { @page { margin: 0.5in } }
+			@media screen {		/* push down footer */
+				HTML { height:100% }
+				BODY { position:relative; box-sizing:border-box; min-height:100%; margin:0 3%; padding:0.3in 0 0.4in }
+				DIV.footer { position:absolute; left:0; bottom:0.1in; margin:0; }
+				}
+			""".replace("{{FONT_FAMILY}}",font_family))
+
+		# If we have any "speaking table cells", add extra style rules to put
+		# a blue border around each and give them a hover effect.
+		if self.require_bgplay:
+			self.add_css("""
+			TD.bgplay, DIV.wrap > DIV.bgplay {border: 1px solid blue !important; cursor: pointer}
+			TD.bgplay:hover, DIV.wrap > DIV.bgplay:hover {background-color: #f0f0f0}
+			""")
+
+		# Add the styles from the ODT document (converted to CSS of course).
+		self.add_css("\n".join(self.styles.get_css(3.0)))
+
+	# Load a template HTML file and copy some things from it
+	# to the output document.
+	def add_template(self):
+		template = lxml.html.parse(open(self.opts.template))
+
+		# Copy <link>, <style>, and <script> elements from the <head> of the
+		# template to the <head> of the document.
+		for el in template.xpath("//head")[0]:
+			if el.tag in ("link", "style", "script"):
+				self.html_head.append(el)
+
+		# If the template has a title, prepend it to the document's title
+		template_title = template.xpath("//head/title")
+		if template_title:
+			template_title = template_title[0].text
+			if template_title:
+				self.title_el.text = "%s: %s" % (template_title, self.metadata['title'])
+
+		# FIXME: this probably contains lots of assumptions about the directory
+		# from which odt2html was invoked. This probably also does not work
+		# with more than one level of index since we do not walk to the root of
+		# the index tree.
+		if self.output_dirname == ".":
+			levels = 0
+		else:
+			levels = (self.output_dirname.count("/") + 1)
+			if self.index_entry is not None and self.index_entry.index.dirname != "":
+				levels -= self.index_entry.index.dirname.count("/")
+		back_to_index = ("../" * levels) if levels > 0 else "./"
+
+		# If available, add fragment identifier of the index section which lists this document
+		if self.index_entry is not None and self.index_entry.section_id is not None:
+			back_to_index = "%s#%s" % (back_to_index, self.index_entry.section_id)
+
+		# Copy <header> elements from the template's body while interpolating
+		# various values indicated in {{varname}} notation.
+		basename = os.path.splitext(os.path.basename(self.odt_filename))[0]
+		i = 0
+		for template_header in template.xpath("//body/header"):
+			for el in ((template_header,) + tuple(template_header.xpath(".//*"))):
+				if el.text:
+					el.text = el.text.replace("{{TITLE}}", self.metadata['title'])
+				if el.tail:
+					el.tail = el.tail.replace("{{TITLE}}", self.metadata['title'])
+				if "href" in el.attrib:
+					if el.attrib['href'] == "{{ODT}}":
+						el.attrib['href'] = "%s.odt" % basename
+					elif el.attrib['href'] == "{{PDF}}":
+						el.attrib['href'] = "%s.pdf" % basename
+					elif "{{BACK_TO_INDEX}}" in el.attrib['href']:
+						el.attrib['href'] = el.attrib['href'].replace("{{BACK_TO_INDEX}}", back_to_index)
+
+			self.html_body.insert(i, template_header)
+			i += 1
+
+	# Add Open Graph tags for social networking
+	# http://ogp.me/
+	# https://css-tricks.com/essential-meta-tags-social-media/
+	# https://cards-dev.twitter.com/validator
+	# https://developers.facebook.com/tools/debug/
+	def add_opengraph(self, site_url, page_url):
+		if 'og:image' in self.metadata:
+			assert self.metadata['og:image'].endswith(".png")
+			assert os.path.isfile(self.metadata['og:image'])
+			assert 'title' in self.metadata
+			if self.opts.site_name is not None:
+				self.html_head.append(E.meta({'property':'og:site_name','content':self.opts.site_name}))
+			self.html_head.append(E.meta({'property':'og:type','content':'article'}))
+			self.html_head.append(E.meta({'property':'og:title','content':self.metadata['title']}))
+			if 'description' in self.metadata:
+				self.html_head.xpath("./meta[@name='description']")[0].attrib['property'] = "og:description"
+			self.html_head.append(E.meta({'property':'og:url','content':page_url}))
+			self.html_head.append(E.meta({'property':'og:image','content':site_url + quote(self.metadata['og:image'])}))
+			with Image.open(self.metadata['og:image']) as img:
+				width, height = img.size
+			self.html_head.append(E.meta({'property':'og:image:width','content':str(width)}))
+			self.html_head.append(E.meta({'property':'og:image:height','content':str(height)}))
+			if 'og:image:alt' in self.metadata:
+				self.html_head.append(E.meta({'property':'og:image:alt','content':self.metadata['og:image:alt']}))
+			self.html_head.append(E.meta({'name':'twitter:card','content':'summary_large_image'}))
+
+	# Added Schema.org metadata
+	# https://developers.google.com/search/docs/data-types/article
+	def add_schema_org(self, site_url, page_url):
+		linked_data = []
+
+		if 'og:image' in self.metadata:
+			assert len(self.opts.indexes) > 0
+			index = self.opts.indexes[0]
+			assert self.metadata['og:image'].endswith(".png")
+			assert os.path.isfile(self.metadata['og:image'])
+			assert 'title' in self.metadata
+			assert 'Publication date' in self.metadata
+			assert index.publisher
+			assert index.author
+			article = {
+				"@context": "http://schema.org",
+				"@type": "Article",
+				"headline": self.metadata['title'],
+				"mainEntityOfPage": page_url,
+				"image": [
+					site_url + quote(self.metadata['og:image'])
+					],
+				"publisher": index.publisher,
+				"author": index.author,
+				"datePublished": self.metadata['Publication date'],
+				"dateModified": self.metadata['Revision date']
+				}
+			if 'description' in self.metadata:
+				article['description'] = self.metadata['description']
+			linked_data.append(article)
+
+		if self.index_entry is None:
+			print("  Warning: document not listed in index, no BreadcrumbList created")
+		else:
+			breadcrumblist = self.index_entry.index.breadcrumblist[:]
+
+			# the index section which lists this document (if there is one)
+			if self.index_entry.section_id is not None and self.index_entry.section_heading is not None:
+				breadcrumblist.append(
+					{
+					"@type": "ListItem",
+					"position": len(breadcrumblist) + 1,
+					"item": {
+						"@id": site_url + "#" + self.index_entry.section_id,
+						"name": self.index_entry.section_heading
+						}
+					})
+
+			# this document itself
+			breadcrumblist.append({
+				"@type": "ListItem",
+				"position": len(breadcrumblist) + 1,
+				"item": {
+					"@id": page_url,
+					"name": self.index_entry.title
+					}
+				})
+
+			linked_data.append({
+				"@context": "http://schema.org",
+				"@type": "BreadcrumbList",
+				"itemListElement": breadcrumblist,
+				})
+
+		if len(linked_data) > 0:
+			script = E.script({'type':'application/ld+json'})
+			script.text = "\n" + json.dumps(linked_data, indent=1, sort_keys=True, ensure_ascii=False) + "\n"
+			script.tail = "\n"
+			self.html_head.append(script)
+
+	# Go through the generated HTML, identify speaking table cells, load the
+	# JavaScript and CSS resources required, and hook the cells up.
+	def enable_td_sound(self):
+		if self.opts.debug:
+			print("Enabling TD sound...")
+		td_sound_lang, td_sound_path = self.td_sound.split(":")
+		m = re.match(r'^(.+)\.txt$', td_sound_path)
+		if m:
+			td_sound_finder = LabelSoundFinder(self.output_dirname, m.group(1))
+		else:
+			td_sound_finder = DirSoundFinder(self.output_dirname, td_sound_path)
+
+		for td in self.html_body.xpath(".//td"):
+			for el in ((td,) + tuple(td)):		# Iterate through the <TD> and its immediate children
+				if el.attrib.get("lang") == td_sound_lang or td_sound_lang == "*":
+					text = self.element_extract_text(el).strip()
+					if text:
+						url = td_sound_finder.find(text)
+						if url:
+							self.require_bgplay = True
+							td.attrib['onclick'] = 'bgplay("%s")' % url
+							td.attrib['class'] = td.attrib.get('class','') + " bgplay"
+						if self.opts.debug:
+							print(u"  %s TD: %s %s" % (td_sound_lang, text, "OK" if url else "Missing"))
+						break
+
+	# If a table's name contains the string "Box", convert it to to a box
+	# and its cells to child boxes which flow into it and wrap like words
+	# in a paragraph. To accomplish this this we:
+	# * Convert <table> to <div class="wrap">
+	# * Drop <col>, <tr>, and <tbody>
+	# * Convert the <td> elements to <div> elements and reinsert them
+	# FIXME: The way we fix up the styles is a horrible hack which breaks
+	# encapsulation. This was done deliberately because the style system
+	# is a mess in need of a rewrite, so we did not want to implement this
+	# correct without breaking something.
+	def wrap_tables(self):
+		if self.opts.debug:
+			print("Fixing up wrappable tables...")
+		for table in self.html_body.xpath(".//table"):
+			if "Wrap" in table.attrib['class']:
+				if self.opts.debug:
+					print("  %s: wrapping" % table.attrib['class'])
+				table.tag = "div"
+				table.attrib['class'] += " wrap"
+				table_css_style = self.styles._by_css_class(table.attrib['class'])
+				table_css_style.template = "DIV.%s"
+				if 'max-width' in table_css_style.properties:
+					del table_css_style.properties['max-width']
+				boxes = []
+				for el in table:
+					if el.tag == "tbody":
+						for tr in el:
+							el.remove(tr)
+							css_style = self.styles._by_css_class(tr.attrib.get('class'))
+							if css_style is not None:
+								css_style.template = "DIV.%s > DIV"
+								css_style.name = table_css_style.name
+							for td in tr:
+								tr.remove(td)
+								td.tag = "div"
+								# If there is a style rule for this table cell and it is not yet converted,
+								css_style = self.styles._by_css_class(td.attrib.get('class',None))
+								if css_style is not None and not 'justify-content' in css_style.properties:
+									css_style.template = "DIV.%s"
+									vertical_align = css_style.properties.pop('vertical-align',None)
+									css_style.properties['justify-content'] = {'top':'flex-start','middle':'center','bottom':'flex-end'}.get(vertical_align,'center')
+								boxes.append(td)
+					elif el.tag == "col":
+						css_style = self.styles._by_css_class(el.attrib.get('class'))
+						css_style.template = "DIV.%s > DIV"
+						css_style.name = table_css_style.name
+					table.remove(el)
+				for box in boxes:
+					table.append(box)
+			elif self.opts.debug:
+				print("  %s: no wrapping" % table.attrib['class'])
+
+	def minimize(self):
+		for el in self.html_head.xpath("//script"):
+			if el.attrib.get('type') == "text/javascript" and el.text is not None:
+				el.text = jsmin(el.text)
+		for el in self.html_head.xpath("//style"):
+			if el.attrib.get('type') == "text/css" and el.text is not None:
+				el.text = cssmin(el.text)
+
+	#------------------------------------------------------------------
+	# Take the HTML BODY object in RAM, wrap it in an HTML element,
+	# added a HEAD, and write it out to disk.
+	#------------------------------------------------------------------
+	def save_html(self, html_filename):
+		with open(html_filename, "wb") as outfh:
+			outfh.write(b"<!DOCTYPE HTML>\n")
+			html_elementtree = ET.ElementTree(element=E.html({"lang":self.styles.default_language}, self.html_head, self.html_body))
+			html_elementtree.write(outfh, encoding="utf-8", pretty_print=True, method="html")
+
+	#------------------------------------------------------------------
+	# Create an EPUB file. An EPUB file is a zip file containing:
+	# * The document as one or more XHTML files
+	# * Images
+	# * An XML table of contents
+	# * A few other metadata files
+	#------------------------------------------------------------------
+	def save_epub(self, epub_filename):
+		epub = zipfile.ZipFile(epub_filename, 'w')
+		epub_uuid = uuid.uuid4().urn
+
+		# MIME type must be first in file and uncompressed
+		epub.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+
+		# Boilerplate
+		epub.writestr("META-INF/container.xml", textwrap.dedent("""\
+			<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+				<rootfiles>
+					<rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+				</rootfiles>
+			</container>
+			"""), zipfile.ZIP_DEFLATED)
+
+		# One copy of stylesheet
+		epub.writestr("stylesheet.css", self.epub_css().encode("utf-8"), zipfile.ZIP_DEFLATED)
+
+		#---------------------------------------------
+		# Start building Content Index
+		# content.opf
+		#---------------------------------------------
+		index_tpl = ET.Element(
+			"{http://www.idpf.org/2007/opf}package",
+			{	"version": "2.0",
+				"unique-identifier": "bookid",
+				},
+			nsmap = {
+				None:"http://www.idpf.org/2007/opf",
+				"dc":"http://purl.org/dc/elements/1.1/"
+				},
+			)
+
+		# Metadata about the book
+		metadata = E.metadata()
+		index_tpl.append(metadata)
+		metadata.append(E("{http://purl.org/dc/elements/1.1/}title",self.metadata['title']))
+		metadata.append(E("{http://purl.org/dc/elements/1.1/}identifier",epub_uuid,{"id":"bookid"}))
+		metadata.append(E("{http://purl.org/dc/elements/1.1/}language","en-US"))
+
+		# List of files in the book
+		manifest = E.manifest()
+		index_tpl.append(manifest)
+
+		# Style for rendering pages in the book
+		manifest.append(E.item({
+			"id":"css",
+			"href":"stylesheet.css",
+			"media-type":"text/css",
+			}))
+
+		# File which gives the book structure
+		manifest.append(E.item({
+			"id":"ncx",
+			"href":"toc.ncx",
+			"media-type":"application/x-dtbncx+xml",
+			}))
+
+		spine = E.spine({"toc":"ncx"})
+		index_tpl.append(spine)
+
+		# FIXME: No <guide> section. Do we need one?
+
+		#-------------------------------------------------------------
+		# Add the HTML, possibly split into a separate file for
+		# each <section> in the ODT file.
+		#-------------------------------------------------------------
+
+		self.html_head.append(E.link({"type":"text/css","rel":"stylesheet","href":"stylesheet.css"}))
+
+		remaining = list(self.html_body)
+		i = 0
+		while len(remaining) > 0:
+			if self.opts.split_by_sections:
+				chunk = E.body()
+				chunk.append(remaining.pop(0))
+				while len(remaining) > 0 and not (remaining[0].tag == "div" and remaining[0].attrib.get("id","").startswith("topsect")):
+					chunk.append(remaining.pop(0))
+			else:
+				chunk = self.html_body
+				remaining = []
+
+			content_id = "content%d" % i
+			content_filename = "content%d.html" % i
+
+			# Add this part to <manifest> element of content.opf so
+			# that the ereader will know it is part of the ebook.
+			manifest.append(E.item({
+				"id":content_id,
+				"href":content_filename,
+				"media-type":"application/xhtml+xml",
+				}))
+
+			# Add this part to <spine> element of content.opf so the
+			# ereader will know where it comes in the reading order.
+			spine.append(E.itemref({
+				"idref":content_id
+				}))
+
+			# Generate the HTML
+			html = E.html(self.html_head, chunk)
+			html.attrib['xmlns'] = 'http://www.w3.org/1999/xhtml'
+			html_elementtree = ET.ElementTree(element=html)
+			text = '<?xml version="1.0" encoding="UTF-8"?>\n' \
+				+ '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">\n' \
+				+ ET.tostring(html_elementtree, encoding="utf-8", pretty_print=True)
+
+			# Add the HTML to the EPUB file
+			epub.writestr(content_filename, text, zipfile.ZIP_DEFLATED)
+
+			i += 1
+
+		#---------------------------------------------
+		# Zip each embedded image and add it to
+		# the manifest
+		#---------------------------------------------
+		i = 1
+		for image in self.images:
+			i += 1
+			manifest.append(E.item({
+				"id":"img-%d" % i,
+				"href":image.filename,
+				"media-type":image.mimetype,
+				}))
+
+			epub.writestr(image.filename, image.get_data(), image.compression)
+
+		#---------------------------------------------
+		# Zip content index and table of contents
+		#---------------------------------------------
+		epub.writestr("content.opf",
+			ET.tostring(ET.ElementTree(element=index_tpl), encoding="utf-8", pretty_print=True),
+			zipfile.ZIP_DEFLATED
+			)
+		epub.writestr("toc.ncx", self.epub_toc(epub_uuid), zipfile.ZIP_DEFLATED)
+
+	# Generate style for an EPUB file
+	def epub_css(self):
+		# The base CSS stylesheet for ebook readers. Remember that
+		# this is CSS 2.1, so no @media queries.
+		css = textwrap.dedent("""\
+			HTML, BODY, H1, H2, H3, H4, H4, P, UL, LI { margin: 0; padding: 0 }
+			BODY { margin: 0.125in; font-size: 12pt }
+			H1, H2, H3, H4, H4 { font-size: inherit }
+			UL, OL { list-style-position: outside }
+			LI, P { position: relative }
+			TABLE { border-collapse: collapse }
+			TH, TD { vertical-align: top }
+			HR.pagebreak { margin: 0.5in -0.5in 0.5in -0.5in }
+			SPAN.space { white-space: pre-wrap }
+			""")
+
+		# Add the converted styles from the ODT file, again limited to CSS 2.1.
+		css += "\n".join(self.styles.get_css(2.1))
+
+		return css
+
+	# Generate the Navigation Control file for XML (NCX) for an EPUB file.
+	# This is the machine-readable table of contents which the ereader
+	# may incorporate into its navigation controls.
+	def epub_toc(self, epub_uuid):
+		ncx = ET.Element(
+			"{http://www.daisy.org/z3986/2005/ncx/}ncx",
+			{	"version": "2005-1",
+				},
+			nsmap = {
+				None:"http://www.daisy.org/z3986/2005/ncx/",
+				},
+			)
+
+		ncx_head = E.head()
+		ncx.append(ncx_head)
+		ncx_head.append(E.meta({"name":"dtb:uid","content":epub_uuid}))
+		ncx_head.append(E.meta({"name":"dtb:depth","content":"1"}))
+		ncx_head.append(E.meta({"name":"dtb:totalPageCount","content":"0"}))
+		ncx_head.append(E.meta({"name":"dtb:maxPageNumber","content":"0"}))
+
+		ncx.append(E.docTitle(E.text(self.metadata['title'])))
+
+		ncx_navmap = E.navMap()
+		ncx.append(ncx_navmap)
+
+		i = 1
+		for h_filename, h_id, h_text in self.h1s:
+			print("  H1:", h_filename, h_id, h_text)
+			ncx_navmap.append(
+				E.navPoint(
+					E.navLabel(E.text(h_text)),
+					E.content({"src":"%s#%s" % (h_filename, h_id)}),
+					{	"id":"navpoint-%d" % i,
+						"playOrder":"%d" % i
+						},
+					),
+				)
+			i += 1
+
+		text = '<?xml version="1.0" encoding="UTF-8"?>\n' \
+			+ '<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN" "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">\n' \
+			+ ET.tostring(ET.ElementTree(element=ncx), encoding="utf-8", pretty_print=True)
+
+		return text
+
+	#------------------------------------------------------------------
+	# Utility functions
+	#------------------------------------------------------------------
+
+	# Is this element empty of text and children?
+	def element_empty(self, el):
+		return el.text is None and el.tail is None and len(list(el)) == 0
+
+	# Extract text from an ODT element and its children.
+	# Throw away any formatting.
+	def element_extract_text(self, el):
+		text = ""
+		if el.text is not None:
+			text += el.text
+		for child_el in el:
+			text += self.element_extract_text(child_el)
+		if el.tail is not None:
+			text += el.tail
+		return text
+
+	# Convert an href to the proper format for the web version.
+	def href_to_html(self, href):
+		href = re.sub(r'\.odt$', '.html', href, flags=re.IGNORECASE)		# change extension
+		href = re.sub(r'/index\.html$', '/', href, flags=re.IGNORECASE)		# drop explicit index.html
+		# see https://tools.ietf.org/html/rfc3986#section-3.3
+		href = quote(unquote(href), safe="/~!$&'()*+,;=:@")
+		return href
+
+	# Insert CSS styles into the head of the document.
+	def add_css(self, css):
+		style = E.style({"type": "text/css"})
+		css = css.strip()
+		css = re.sub(r"^\t\t\t", "", css, flags=re.MULTILINE)
+		style.text = "\n" + css + "\n"
+		self.html_head.append(style)
+
+#============================================================================
+# These classes take ODF stylesheets and convert them to CSS stylesheets.
+#============================================================================
+
+# Represents a style rule
+class CssStyle(object):
+	def __init__(self, name):
+		self.name = name			# name for ODF file
+		self.template = None		# printf style template
+		self.properties = {}		# what to put inside the curly brackets
+		self.media = None			# media query condition
+		self.used = False			# mentioned in document?
+		self.simplified_td = False	# Have we dropt part of the name of a TD style?
+		self.subst = None			# is this the same as some other style?
+		self.break_before = None	# "page" for page break before
+		self.language = None		# not CSS, but where else can we put this?
+	def set_parent(self, parent):
+		self.properties.update(parent.properties)
+		self.media = parent.media
+		self.break_before = parent.break_before
+		self.language = parent.language
+	def __unicode__(self):
+		return "%s %s" % (self.template % self.className(), str(self.properties))
+	def className(self):			# name converted to legal CSS class name
+		return self.name.replace('.','_')
+	def hashable(self):
+		if self.simplified_td:
+			return (self.template % self.className(), str(self.properties))
+		else:
+			return (self.template, str(self.properties))
+	def get_text(self, css_version):
+		style_text = "%s{%s}" % (
+			self.template % self.className(),
+			";".join(["%s:%s" % (name, value) for name, value in self.properties.items()])
+			)
+		if self.media is not None and css_version >= 3.0:
+			style_text = "@media %s { %s }" % (
+				self.media,
+				style_text
+				)
+		return style_text
+
+class CssListStyle(CssStyle):
+	def __init__(self, name):
+		CssStyle.__init__(self, name)
+		self.tag = None
+		self.levels = []
+	def add_level(self, level, indentation):
+		self.levels.append(indentation)
+		assert len(self.levels) == level, "Incorrect levels in list style %s" % self.name
+	def __unicode__(self):
+		return "%s.%s: " % (self.tag, self.name) + ", ".join(self.levels)
+	def hashable(self):
+		return (self.tag, self.levels)
+	def get_text(self, css_version):
+		css_text = []
+		css_text.append("%s.%s LI{margin-left:0;text-indent:0}" % (self.tag, self.name))
+		count = 0
+		for level in self.levels:
+			css_text.append("%s.%s" % (self.tag, self.name) + (" %s" % self.tag) * count + "{padding-left:%s}" % level)
+			count += 1
+		return "\n".join(css_text)
+
+class OdtStyle2Css(object):
+	# Generic font names in ODF are different from those in CSS!
+	font_family_map = {
+		"roman":"serif",
+		"swiss":"sans-serif",
+		"modern":None,
+		"script":"cursive",
+		}
+
+	def __init__(self, opts):
+		self.opts = opts
+
+		self.dimensions_re = re.compile("(^[-0-9\.]+)((in)|(pt)|(mm)|(cm)|(px))$")
+		self.fonts = {}
+		self.styles_ordered = []		# preserves original order (really necessary?)
+		self.styles_byselector = {}		# by tag and class (for inclusion of parent styles)
+		self.styles_byname = {}			# by name from ODT file
+		self.styles_byhashable = {}		# for dedupping
+
+	# When you find the <font-face-decls>, pass it to this function.
+	def add_fonts(self, odt_font_face_decls):
+		for font_face in odt_font_face_decls:
+			name = font_face.attrib["name"]
+			font_families = []
+			if self.opts.font_support_level >= 2 and "font-family" in font_face.attrib:
+				value = font_face.attrib["font-family"]
+				font_families.append(value)
+			if "font-family-generic" in font_face.attrib:	# give the generic font name in any case
+				value = font_face.attrib["font-family-generic"]
+				value = self.font_family_map.get(value, None)
+				if value is not None:
+					font_families.append(value)
+			if "font-pitch" in font_face.attrib:
+				value = font_face.attrib["font-pitch"]
+				if value == "fixed":
+					font_families.append("monospace")
+			self.fonts[name] = ",".join(font_families)
+
+	# When one of the styles tags (of which there are several) is found,
+	# it is passed to this function.
+	def add_stylesheet(self, odt_stylesheet):
+		if self.opts.debug:
+			print("===== Converting ODF Stylesheet =====")
+
+		# Make first pass.
+		dependent = []
+		for style in list(odt_stylesheet):
+			if not self.add_style(style):
+				dependent.append(style)
+
+		# Make a second pass to convert styles which had unresolved dependencies.
+		for style in dependent:
+			if not self.add_style(style):
+				raise OdfInvalid("missing parent for style: %s %s" % (style.tag, style.attrib))
+
+		if self.opts.debug:
+			print
+
+	# Take an ODF stylesheet tag and its children and add them to the HTML
+	# document's CSS stylesheet.
+	# Returns True if the style's dependencies (if any) were fulfilled and it
+	# has been added to the HTML document's stylesheet.
+	def add_style(self, odt_style):
+		if self.opts.debug:
+			print("  %s %s" % (odt_style.tag, odt_style.attrib))
+
+		if odt_style.tag == "style":
+			css_style = CssStyle(odt_style.attrib['name'])
+
+			style_family = odt_style.attrib['family']
+			if style_family == "text":
+				css_style.template = "SPAN.%s"
+			elif style_family == "paragraph":
+				css_style.template = ".%s"	# P, H[12345], LI, or even TD
+			elif style_family == "table":
+				css_style.template = "TABLE.%s"
+			elif style_family == "table-column":
+				css_style.template = "COL.%s"
+			elif style_family == "table-row":
+				css_style.template = "TR.%s"
+			elif style_family == "table-cell":
+				css_style.template = "TD.%s"
+			elif style_family == "graphic":
+				css_style.template = ".%s"		# <IMG> or <DIV> or <NAV>
+			elif style_family == "section":
+				css_style.template = "DIV.%s"
+			else:
+				if self.opts.debug:
+					print("    unimplemented style family: %s" % style_family)
+				return True
+
+			# If this style has a parent, import its attributes.
+			parent_style_name = odt_style.attrib.get("parent-style-name")
+			if parent_style_name is not None:
+				parent_style = self.styles_byselector.get((css_style.template,parent_style_name))
+				if parent_style is None:
+					if self.opts.debug:
+						print("    deferring loading")
+					return False
+				css_style.set_parent(parent_style)
+
+			# Process the <style:style>'s child elements.
+			for el in odt_style:
+				if self.opts.debug:
+					print("    %s %s" % (el.tag, odt_style.attrib))
+				if not el.tag.endswith("-properties"):
+					if self.opts.debug:
+						print("      unimplemented style child: %s" % el.tag)
+					continue
+
+				# Convert properties which are generally applicable to block items.
+				for prop in (
+						"margin", "margin-left", "margin-right", "margin-top", "margin-bottom",
+						"padding", "padding-left", "padding-right", "padding-top", "padding-bottom",
+						"border", "border-left", "border-right", "border-top", "border-bottom",
+					):
+					if prop in el.attrib:					# If this attribute is defined,
+						value = el.attrib[prop]
+						if value != "100%":					# don't know what 100% is supposed to mean, but it is poison...
+							css_style.properties[prop] = self.clean_dimensions(value)
+
+				if el.tag == "section-properties":
+					for el2 in el:
+						if el2.tag == "columns":
+							for prop in ("column-count", "column-gap"):
+								if prop in el2.attrib:
+									css_style.media = "(min-width:8in)"
+									css_style.properties[prop] = el2.attrib[prop]
+									css_style.properties["-webkit-%s" % prop] = el2.attrib[prop]
+									css_style.properties["-moz-%s" % prop] = el2.attrib[prop]
+									css_style.properties["clear"] = "both"		# looks better this way
+
+				# To text blocks
+				elif el.tag == "paragraph-properties":
+					for prop in ("text-align", "text-indent", "background-color"):
+						if prop in el.attrib:
+							css_style.properties[prop] = el.attrib[prop]
+					if "line-height" in el.attrib:
+						value = el.attrib["line-height"]
+						# Convert percentage line height to multiplication factor because percentage
+						# line height is inherited differently in ODF and in CSS.
+						m = re.match(r'^(\d+)%$', value)
+						if m:
+							value = "%.2f" % (int(m.group(1)) / 100.0)
+						css_style.properties["line-height"] = value
+					if "break-before" in el.attrib:
+						css_style.break_before = el.attrib["break-before"]
+						# Webkit uses non-standard attribute
+						if el.attrib["break-before"] == "column":
+							css_style.properties["-webkit-column-break-before"] = "always"
+					if "border" in el.attrib:
+						css_style.properties["border"] = el.attrib['border']
+
+				# Text in blocks or inline
+				elif el.tag == "text-properties":
+					if self.opts.font_support_level >= 1:
+						font_name = el.attrib.get("font-name")
+						if font_name is not None:
+							font_family = self.fonts[font_name]
+							if font_family != "":
+								css_style.properties["font-family"] = font_family
+
+					for prop in ("font-size", "font-style", "font-weight", "background-color"):
+						if prop in el.attrib:
+							css_style.properties[prop] = el.attrib[prop]
+
+					# Stash language in CSS object
+					if "language" in el.attrib:
+						css_style.language = el.attrib["language"]
+
+					# Drop black except on spans since we believe it is just noise.
+					if "color" in el.attrib:
+						color = el.attrib["color"]
+						if color != "#000000" or style_family == "text":
+							css_style.properties["color"] = color
+
+					if "text-position" in el.attrib:
+						m = re.match("^((super)|(sub)|(\d+%))( (\d+%))?$", el.attrib["text-position"])
+						if not m:
+							raise OdfNotImplemented("unrecognized text position: %s" % el.attrib["text-position"])
+						else:
+							vertical_align = m.group(1)
+							font_scale = m.group(6)
+							if font_scale is None:
+								if vertical_align == "super" or vertical_align == "sub":
+									font_scale = "60%"
+							if vertical_align == "0%":
+								print("  Warning: nested text-position in %s not converted correctly" % css_style.name)
+							else:
+								css_style.properties["vertical-align"] = vertical_align
+								if font_scale is not None:
+									css_style.properties["font-size"] = font_scale
+
+					if el.attrib.get("text-underline-style","none") != "none":
+						css_style.properties["text-decoration"] = "underline"
+
+					# FIXME: has side effect of canceling underlining
+					if el.attrib.get("text-line-through-style","none") != "none":
+						css_style.properties["text-decoration"] = "line-through"
+
+				elif el.tag == "table-properties":
+					width = el.attrib.get("width")
+					# If the table is width is "auto" or has an explicit width wide enough
+					# to reach the likely margins, assume the intent was to make it 100% wide.
+					if self.dimension2points(width) > (7.0 * 72.0):
+						css_style.properties["width"] = "100%"
+						css_style.properties["clear"] = "both"
+					# Otherwise, use the requested width, but make it the maxiumum
+					# width so that the table can shrink in small displays.
+					else:
+						css_style.properties["max-width"] = width
+
+					if "align" in el.attrib:
+						align = el.attrib["align"]
+						if align == "right":
+							css_style.properties['margin-left'] = 'auto'
+						elif align == "center":
+							css_style.properties['margin-left'] = 'auto'
+							css_style.properties['margin-right'] = 'auto'
+
+				elif el.tag == "table-column-properties":
+					if "column-width" in el.attrib:
+						css_style.properties["width"] = el.attrib['column-width']
+
+				elif el.tag == "table-row-properties":
+					if "min-row-height" in el.attrib:
+						css_style.properties["height"] = el.attrib['min-row-height']
+
+				if el.tag == "table-cell-properties":
+					vertical_align = el.attrib.get('vertical-align','top')
+					if vertical_align == "middle" or vertical_align == "bottom":
+						css_style.properties['vertical-align'] = vertical_align
+
+				if el.tag == "graphic-properties":
+					if el.attrib.get('vertical-rel') == 'baseline':
+						pass
+					else:
+						horizontal_pos = el.attrib.get('horizontal-pos')
+						if horizontal_pos in ('left', 'right'):
+							css_style.properties['float'] = horizontal_pos
+						elif horizontal_pos == 'from-left':
+							css_style.properties['float'] = 'left'
+						elif horizontal_pos == 'center':
+							css_style.properties['display'] = 'block'
+							css_style.properties['margin-left'] = 'auto'
+							css_style.properties['margin-right'] = 'auto'
+					# Without this, links will get tangled with the links of the parallel paragraph.
+					# Why does not seem to be well-understood.
+					if 'float' in css_style.properties:
+						css_style.properties['position'] = 'relative'
+						css_style.properties['z-index'] = '1'
+
+			# FIXME: read up on this. Does this attribute really indicate a new page?
+			# NOTE: this will override the break-before in <paragraph-properties>
+			if "master-page-name" in odt_style.attrib and odt_style.attrib["master-page-name"] != "":
+				css_style.break_before = "page"
+
+			# If we are simplifying table cell borders, make all four borders the
+			# same by picking the last one listed which is not "none".
+			if style_family == "table-cell" and self.opts.simplify_table_borders:
+				for name, value in list(css_style.properties.items()):
+					if name.startswith("border-"):
+						del css_style.properties[name]
+						if value != "none":
+							css_style.properties["border"] = value
+				if not 'vertical-align' in css_style.properties:
+					css_style.template = "TABLE.%s TD"
+					css_style.simplified_td = True
+					css_style.name = css_style.name.split(".")[0]	# drop the cell part of the name
+
+			if self.opts.debug:
+				print("    -->%s" % str(css_style))
+
+			# Add to list of all styles.
+			self.styles_ordered.append(css_style)
+
+			# For handling parent-style-name attribute
+			self.styles_byselector[(css_style.template, css_style.name)] = css_style
+
+			# If this style actually will appear in the CSS stylesheet,
+			if not css_style.simplified_td:
+				self.styles_byname[css_style.name] = css_style
+
+			# If this style has the same right-hand-side as a style defined earlier,
+			# note that that that earlier style could be used as a substitute to save
+			# space in the HTML output file.
+			hashable = css_style.hashable()
+			css_style.subst = self.styles_byhashable.get(hashable)
+			if css_style.subst is None:
+				self.styles_byhashable[hashable] = css_style
+				if css_style.simplified_td:
+					css_style.used = True		# safe assumption?
+
+		elif odt_style.tag == "default-style":
+			# FIXME: mostly unimplemented
+			# <style:default-style style:family="paragraph">
+			#  <style:paragraph-properties fo:hyphenation-ladder-count="no-limit" style:text-autospace="ideograph-alpha" style:punctuation-wrap="hanging" sty
+			#  <style:text-properties style:use-window-font-color="true" style:font-name="Liberation Serif" fo:font-size="12pt" fo:language="en" fo:country="US"
+			# </style:default-style>
+			if odt_style.attrib['family'] == "paragraph":
+				for el in odt_style:
+					if el.tag == "text-properties":
+						self.default_language = el.attrib['language']
+						self.default_font_family = el.attrib['font-name']
+
+		# Partial implementation of List Styles
+		# FIXME: converting ODT style to a whole set of CSS styles is messy
+		elif odt_style.tag == "list-style":
+			style_name = odt_style.attrib['name']
+			previous_margin_left = 0.0
+			css_style = CssListStyle(style_name)
+			for el in odt_style:
+				if el.tag == 'list-level-style-bullet':
+					css_style.tag = "UL"
+				elif el.tag == 'list-level-style-number':
+					css_style.tag = "OL"
+				else:
+					raise OdfNotImplementedYet("Unsupported list-style element: %s" % el.tag)
+				level = int(el.attrib['level'])
+				#print("list %s level %d" % (css_style.name, level))
+				for el2 in el:
+					if el2.tag == 'list-level-properties':
+						for el3 in el2:
+							if el3.tag == 'list-level-label-alignment' and el3.attrib.get('label-followed-by') == 'listtab':
+								margin_left = self.dimension2points(el3.attrib['margin-left'])
+								#print(" margin-left:", margin_left)
+								css_style.add_level(level, "%.2fpt" % (margin_left - previous_margin_left))
+								previous_margin_left = margin_left
+								break
+						else:		# presumably "space"
+							css_style.add_level(level, "18pt")
+							previous_margin_left += 18
+						break
+				else:
+					OdfInvalid("list-style %s has not list-level-properties" % css_style.name)
+
+			self.styles_ordered.append(css_style)
+			self.styles_byname[css_style.name] = css_style
+
+		elif self.opts.debug:
+			print("      unimplemented style tag: %s" % odt_style.tag)
+
+		return True
+
+	# Used to determine whether a style has been simplified away.
+	def style_still_exists(self, style_name):
+		return style_name in self.styles_byname
+
+	# Test whether the style has one or more attributes matching a wildcard expression.
+	def test(self, style_name, pattern):
+		if style_name is None:
+			return False
+		style = self.styles_byname.get(style_name)
+		if style is None:
+			return False
+		return len(fnmatch.filter(style.properties.keys(), pattern))
+
+	# The HTML generator calls this when it adds an element which uses a styles.
+	# If the style exists, a note is made to include it in the CSS and the
+	# HTML class to use is returned. Otherwise, None is returned.
+	def claim_style(self, style_name):
+		if not style_name in self.styles_byname:
+			if not style_name.startswith("M"):
+				print("  Warning: style %s used but not defined" % style_name)
+			return None, None		# nix it
+		css_style = self.styles_byname[style_name]
+		if self.opts.collapse_styles and css_style.subst is not None:
+			css_style = css_style.subst
+		css_style.used = True
+		return css_style.className(), css_style.language
+
+	# For the wrapping tables hack
+	def _by_css_class(self, css_class):
+		if css_class is None:
+			return None
+		class_name = css_class.split(" ")[0]
+		if class_name == "":
+			return None
+		if not class_name in self.styles_byname:	# hack "Table1_A" back to "Table1.A"
+			class_name = class_name.replace("_",".")
+		return self.styles_byname[class_name]
+
+	def get_break_before(self, style_name):
+		if not style_name in self.styles_byname:	# because we do not yet convert all styles
+			return None
+		return self.styles_byname[style_name].break_before
+
+	# Return the converted styles as an array of CSS lines.
+	def get_css(self, css_version):
+		css = []
+		for css_style in self.styles_ordered:
+			if css_style.used or (not self.opts.drop_unused_styles):
+				css.append(css_style.get_text(css_version))
+		return css
+
+	# Parse the right-hand side of a CSS style setting, find the numeric
+	# dimensions and enforce a minimum size. In the process, all units
+	# get converted to points.
+	def clean_dimensions(self, style_arg):
+		words = []
+		for word in style_arg.split(" "):
+			if self.dimensions_re.match(word):
+				points = self.dimension2points(word)
+				if points >= 0.8:
+					word = "%.2fpt" % points
+				elif points < 0.0001:
+					word = "0pt"
+				else:
+					word = "thin"
+			words.append(word)
+		return " ".join(words)
+
+	# Convert a CSS-style dimension with units into points.
+	# We use this when making comparisons.
+	def dimension2points(self, dimension):
+		m = self.dimensions_re.match(dimension)
+		if m:
+			if m.group(2) == "pt":
+				return float(m.group(1))
+			elif m.group(2) == "in":
+				return float(m.group(1)) * 72.0
+			elif m.group(2) == "mm":
+				return float(m.group(1)) * 72.0 / 25.4
+			elif m.group(2) == "cm":
+				return float(m.group(1)) * 72.0 / 2.54
+			elif m.group(2) == "px":
+				return float(m.group(1)) * 0.72			# about 100 DPI
+		raise OdfNotImplementedYet("dimension not understood: %s" % dimension)
+
+#============================================================================
+# Images
+#============================================================================
+class Odt2HtmlImage(object):
+	def __init__(self, odt, filename, svg2png):
+		self.odt = odt
+		self.filename = filename
+		self.svg2png = svg2png
+
+		if self.filename.endswith(".png"):
+			self.mimetype = "image/png"
+			self.compression = zipfile.ZIP_STORED
+		elif self.filename.endswith(".gif"):
+			self.mimetype = "image/gif"
+			self.compression = zipfile.ZIP_STORED
+		elif self.filename.endswith(".jpg"):
+			self.mimetype = "image/jpeg"
+			self.compression = zipfile.ZIP_STORED
+		elif self.filename.endswith(".svg"):
+			self.mimetype = "image/svg+xml"
+			self.compression = zipfile.ZIP_DEFLATED
+		else:
+			raise OdfNotImplemented("Href extension not recognized: %s" % self.filename)
+
+		self.original_filename = self.filename
+		self.original_mimetype = self.mimetype
+
+		if self.mimetype == "image/svg+xml" and self.svg2png:
+			self.filename = "%s.png" % self.filename
+			self.mimetype = "image/png"
+			self.compression = zipfile.ZIP_STORED
+
+	# Return image data as bytes
+	def get_data(self, pretty_print=True):
+		if self.original_mimetype == "image/svg+xml":
+			if self.svg2png:
+				import cairo
+				import rsvg
+				import StringIO
+				svg = rsvg.Handle()
+				svg.write(self.odt.open(self.original_filename).read())
+				svg.close()
+				width, height = svg.get_dimension_data()[:2]
+				surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+				svg.render_cairo(cairo.Context(surface))
+				out_fh = StringIO.StringIO()
+				surface.write_to_png(out_fh)
+				return out_fh.getvalue()
+			else:
+				tree = ET.parse(self.odt.open(self.original_filename))
+				# FIXME: not sure why we need to take a list here. Also, shouldn't there
+				# be just one element, namely <svg>?
+				for el in list(tree.iter()):
+					self.prune_svg(el)
+				return ET.tostring(tree, pretty_print=pretty_print, encoding="utf-8")	# yes, utf-8
+		else:
+			return self.odt.open(self.original_filename).read()
+
+	# Remove SVG elements and attributes inserted by Inkscape but which are
+	# not needed for display in a web browser.
+	def prune_svg(self, element):
+		for key in element.attrib.keys():
+			if key.startswith("{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}"):
+				del element.attrib[key]
+			elif key.startswith("{http://inkscape.sourceforge.net/DTD/sodipodi-0.dtd}"):
+				del element.attrib[key]
+			elif key.startswith("{http://www.inkscape.org/namespaces/inkscape}"):
+				del element.attrib[key]
+		for child in list(element):
+			#print(child.tag)
+			if child.tag.startswith("{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}"):
+				element.remove(child)
+			if child.tag.startswith("{http://inkscape.sourceforge.net/DTD/sodipodi-0.dtd}"):
+				element.remove(child)
+			elif child.tag.startswith("{http://www.inkscape.org/namespaces/inkscape}"):
+				element.remove(child)
+			elif child.tag == "{http://www.w3.org/2000/svg}metadata":
+				element.remove(child)
+			else:
+				self.prune_svg(child)
+
+#============================================================================
+# TD Sound
+#============================================================================
+
+# Audacity label file with the labels in the order in which they will be used
+class LabelSoundFinder(object):
+	def __init__(self, output_dirname, soundfile_basename):
+		self.output_dirname = output_dirname
+		self.base_url = quote(soundfile_basename)
+		self.labels = []
+		with open(os.path.join(self.output_dirname, "%s.txt" % soundfile_basename), "r", encoding="utf-8") as f:
+			for line in f:
+				start, stop, text = line.rstrip().split("\t")
+				assert re.match(r'^\d+\.\d+$', start)
+				assert re.match(r'^\d+\.\d+$', stop)
+				self.labels.append([text, "t=%s,%s" % (start, stop)])
+		print("labels:", self.labels)
+	def find(self, text):
+		text = text.replace(u"\u0301","")	# Remove stress marks.
+		text = text.replace(u"ё", u"е")		# Audacity will not accept ё
+		if len(self.labels) > 0 and self.labels[0][0] == text:
+			label = self.labels.pop(0)
+			return "%s.ogg#%s" % (self.base_url, label[1])
+		else:
+			return None
+
+# Directory of individual sound files
+class DirSoundFinder(object):
+	def __init__(self, output_dirname, td_sound_dir):
+		self.output_dirname = output_dirname
+		self.td_sound_dir = td_sound_dir
+		self.dup_counts = {}
+	def find(self, text):
+		text = text.replace(u"\u0301","")	# Remove stress marks.
+		dup_count = self.dup_counts[text] = self.dup_counts.get(text,0) + 1
+		for filename in (
+				"%s/%s-%d" % (self.td_sound_dir, text, dup_count),
+				"%s/%s" % (self.td_sound_dir, text),
+				"%s/%s" % (self.td_sound_dir, text.replace("?",""))
+				):
+			if os.path.exists("%s/%s.ogg" % (self.output_dirname, filename)) and os.path.exists("%s/%s.mp3" % (self.output_dirname, filename)):
+				#url = "%s/%s.ogg" % (self.output_dirname, filename)
+				url = "%s.ogg" % filename
+				return quote(url)
+		return None
+
+#============================================================================
+# Exceptions
+#============================================================================
+
+# We don't have this case covered
+class OdfNotImplementedYet(Exception):
+	pass
+
+# We do know about this case, but do not plan to support it.
+class OdfNotSupported(Exception):
+	pass
+
+# The input file looks corrupt
+class OdfInvalid(Exception):
+	pass
+
+# Hyperlink with special target of "player" does not have the correct format.
+class OdfBadPlayer(Exception):
+	pass
+
+# Formatting that will not translate well
+class OdfBadFormatting(Exception):
+	pass
+
+#============================================================================
+# Main
+#============================================================================
+if __name__ == "__main__":
+	verbose = False
+	force = False
+	output_directory = None
+	opts = Odt2HtmlOptions()
+	while len(sys.argv) >= 2 and sys.argv[1].startswith("-"):
+		if sys.argv[1] == "--debug":
+			opts.debug = 1
+			force = True
+		elif sys.argv[1] == "--verbose":
+			verbose = True
+		elif sys.argv[1] == "--force":
+			force = True
+		elif sys.argv[1] == "--epub":
+			opts.output_format = "epub"
+		elif sys.argv[1].startswith("--site-name="):
+			opts.site_name = sys.argv[1][12:]
+			assert len(opts.site_name) > 0
+		elif sys.argv[1].startswith("--site-url="):
+			opts.site_url = sys.argv[1][11:]
+			if not opts.site_url.endswith("/"):
+				opts.site_url += "/"
+		elif sys.argv[1].startswith("--nav-names="):
+			opts.nav_names = sys.argv[1][12:].split(",")
+		elif sys.argv[1].startswith("--index="):
+			opts.indexes.append(Odt2HtmlIndex(sys.argv[1][8:]))
+		elif sys.argv[1].startswith("--font-support-level="):
+			opts.font_support_level = int(sys.argv[1][21:])
+		elif sys.argv[1].startswith("--template="):
+			opts.template = sys.argv[1][11:]
+			assert os.path.isfile(opts.template)
+		elif sys.argv[1].startswith("--player-lib-dir="):
+			opts.player_lib_dir = sys.argv[1][17:]
+			assert os.path.isdir(opts.player_lib_dir)
+		elif sys.argv[1] == "-o":
+			if len(sys.argv) >= 3:
+				sys.argv.pop(1)	# -o
+				output_directory = sys.argv[1]
+			else:
+				sys.stderr.write("Missing argument to -o\n")
+				sys.exit(1)
+		else:
+			sys.stderr.write("Unrecognized option: %s\n" % sys.argv[1])
+			sys.exit(1)
+		sys.argv.pop(1)
+
+	count_total = 0
+	count_built = 0
+	count_rebuilt = 0
+	for filename in sys.argv[1:]:
+		if verbose:
+			print(u"\"%s\"" % filename)
+		filename_mtime = os.path.getmtime(filename)
+
+		basename, ext = os.path.splitext(filename)
+		if ext != ".odt":
+			sys.stderr.write("Not an ODT file: %s\n" % filename)
+			sys.exit(1)
+		if output_directory is None:
+			output_filename = "%s.%s" % (basename, opts.output_format)
+		else:
+			output_filename = os.path.join(output_directory, "%s.%s" % (os.path.basename(basename), opts.output_format))
+
+		count_total += 1
+		build = False
+		if not os.path.exists(output_filename):
+			if verbose:
+				print("  building...")
+			count_built += 1
+			build = True
+		elif force or os.path.getmtime(output_filename) < filename_mtime:
+			if verbose:
+				print("  rebuilding...")
+			count_rebuilt += 1
+			build = True
+
+		if build:
+			if os.path.exists(output_filename):
+				os.unlink(output_filename)
+
+			gz_filename = "%s.gz" % output_filename
+			if os.path.exists(gz_filename):
+				os.unlink(gz_filename)
+
+			# Perform the conversion
+			try:
+				Odt2Html(filename, output_filename, opts)
+			except OdfNotImplementedYet as e:
+				sys.stderr.write("ODF feature not implemented: %s\n" % str(e))
+				sys.exit(1)
+			except OdfNotSupported as e:
+				sys.stderr.write("Change unsupported formatting: %s\n" % str(e))
+				sys.exit(1)
+			except OdfInvalid as e:
+				sys.stderr.write("ODT file is invalid: %s\n" % str(e))
+				sys.exit(1)
+			except OdfBadPlayer as e:
+				sys.stderr.write("Bad player: %s\n" % str(e))
+				sys.exit(1)
+
+			# Make the creation time of the HTML file one millisecond after the
+			# creation time of the ODT file from which it was made.
+			os.utime(output_filename, (filename_mtime + 0.01, filename_mtime + 0.01))
+		elif verbose:
+			print("  up-to-date")
+
+	print("Built %d and rebuilt %d of %d files." % (count_built, count_rebuilt, count_total))
+

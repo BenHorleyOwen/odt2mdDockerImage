@@ -1,0 +1,211 @@
+#!/bin/bash
+# Script used to convert odt file to markdown file.
+
+#shopt -o -s xtrace
+
+PANDOC="pandoc"
+ODT2HTML="odt2html"
+
+# Function to diaply a warning to the user.
+function alertwarning(){
+  tty -s
+  if [ "0" == "$?" ]; then
+    echo "$1"
+  else
+    zenity --warning --text="$1"
+  fi
+}
+
+# Increase header level +1
+read -r -d '' HEADERS <<'EOF'
+from pandocfilters import toJSONFilter, Header
+
+def headers(key, value, format, meta):
+  if key == 'Header':
+      return Header(value[0] + 1, value[1], value[2])
+
+if __name__ == "__main__":
+  toJSONFilter(headers)
+EOF
+
+# Extract embeded images
+read -r -d '' IMAGES <<'EOF'
+import sys
+import base64
+from pandocfilters import toJSONFilter, Image
+try:
+   from StringIO import StringIO
+except ImportError:
+   from io import StringIO
+
+count=1
+basename=sys.argv[1]
+
+def images(key, value, format, meta):
+  global count
+  global basename
+  if key == 'Image' and value[1][0].startswith('data:'):
+    src = value[1][0]
+    start = src.find(',')
+    ext = src[src.find('/')+1:src.find(';')]
+    filename = '%s-%s.%s' % (basename, count, ext)
+    with open(filename, 'w') as f:
+      base64.decode(StringIO(src[start:]), f)
+    value[1][0] = filename
+    # Increase image count
+    count=count+1
+    return Image(value[0],value[1])
+
+if __name__ == "__main__":
+  toJSONFilter(images)
+EOF
+
+# Replace LineBreak from Table and BulletList by LBTOK
+read -r -d '' LINEBREAKS <<'EOF'
+from pandocfilters import walk, toJSONFilter, Str, Table, Plain, BulletList
+
+def replace_linebreaks(key, value, format, meta):
+  # Replace Line break by token
+  if key == 'LineBreak':
+    return Str('LBTOK')
+
+def replace_linebreaks_from(key, value, format, meta):
+  # Keep last line break.
+  if key == 'Plain':
+    return Plain(walk(value[:-1], replace_linebreaks, format, meta) + [value[-1]])
+
+def linebreaks(key, value, format, meta):
+  if key == 'Table':
+      return Table(value[0], value[1], value[2], value[3], walk(value[4], replace_linebreaks_from, format, meta))
+  if key == 'BulletList':
+    return BulletList(walk(value, replace_linebreaks, format, meta))
+
+if __name__ == "__main__":
+  toJSONFilter(linebreaks)
+EOF
+
+# Style Div / Para
+read -r -d '' DIVSTYLES <<'EOF'
+from pandocfilters import toJSONFilter, Div, Str, LineBreak
+
+def divstyles(key, value, format, meta):
+  if key == 'Div' and len(value[0][1])>0:
+    # Create string similare to {: .text-muted }
+    style = '{: ' + ' '.join(['.' + x for x in value[0][1]]) + '}'
+    # Remove attributes from originals
+    value[0][1] = []
+    # Try to add our style string to div content.
+    if value[1][-1]['t'] == 'Plain':
+      value[1][-1]['c'].append(LineBreak())
+      value[1][-1]['c'].append(Str(style))
+    else:
+        value[1].append(Str(style))
+    return Div(*value)
+
+if __name__ == "__main__":
+  toJSONFilter(divstyles)
+EOF
+
+# Remove western from Header
+read -r -d '' WESTERNS <<'EOF'
+from pandocfilters import toJSONFilter, Header, Div, CodeBlock
+
+def filter_attrs(attrs):
+  """Remove western attributes. Also remove `-western` suffix."""
+  return [x.replace('-western', '')
+          for x in attrs
+          if x != 'western']
+
+def remove_westerns(key, value, format, meta):
+  # Header Int Attr [Inline]
+  if key == 'Header' and len(value[1][1]) > 0:
+    value[1][1] = filter_attrs(value[1][1])
+    return Header(*value)
+
+  # Div Attr [Block]
+  if key == 'Div' and len(value[0][1]) > 0:
+    value[0][1] = filter_attrs(value[0][1])
+    return Div(*value)
+
+  # CodeBlock Attr String
+  if key == 'CodeBlock' and len(value[0][1]) > 0:
+    value[0][1] = filter_attrs(value[0][1])
+    return CodeBlock(*value)
+
+if __name__ == "__main__":
+  toJSONFilter(remove_westerns)
+EOF
+
+
+# Check if pandoc is available
+if ! (command -v "$PANDOC" >/dev/null 2>&1); then
+  alertwarning "$PANDOC is missing!"
+  exit 2
+fi
+
+# Check if odt2html exists
+if ! (command -v "$ODT2HTML" >/dev/null 2>&1); then
+  alertwarning "$ODT2HTML is missing!"
+  exit 2
+fi
+
+# Loop on every arguments
+for F in "$@"; do
+
+  # Convert file to HTML
+  TFILE="/tmp/$(basename $0).$$.html"
+  "$ODT2HTML" --output="$TFILE" --format=html "$F"
+
+  # Fix <li> issues
+  lead='^<[ou]l>$'
+  tail='^<\/[ou]l>$'
+  sed -i.bak "/$lead/,/$tail/{s#<li/>##g}" "$TFILE"
+  sed -i.bak "/$lead/,/$tail/{s/<p/<li/g}" "$TFILE"
+  sed -i.bak "/$lead/,/$tail/{s/<\/p>/<\/li>/g}" "$TFILE"
+  sed -i.bak "/$lead/,/$tail/{s/<br \/>//g}" "$TFILE"
+  
+  # Fix <table> issues - remove <p> from <table>
+  lead='^<table'
+  tail='^<\/table>$'
+  sed -i.bak "/$lead/,/$tail/{s/<p[^>]*><br\/>//g}" "$TFILE"
+  sed -i.bak "/$lead/,/$tail/{s/<p[^>]*>//g}" "$TFILE"
+  sed -i.bak "/$lead/,/$tail/{s/<\/p>/<br \/>/g}" "$TFILE"
+  #sed -i.bak "/$lead/,/$tail/{s/<br \/>//g}" "$TFILE"
+
+  # Convert <p> to <div> to keep attributes
+  sed -i.bak "s/<p /<div /g" "$TFILE"
+  sed -i.bak "s/<p>/<div>/g" "$TFILE"
+  sed -i.bak "s/<\/p>/<\/div>/g" "$TFILE"
+
+  # Convert file to markdown.
+  MDFILE=${1%.*}.md
+  "$PANDOC" --from=html --to=json "$TFILE" | \
+    python -c "$WESTERNS" | \
+    python -c "$HEADERS" | \
+    python -c "$LINEBREAKS" | \
+    python -c "$DIVSTYLES" | \
+    python -c "$IMAGES" "${1%.*}" | \
+    "$PANDOC" --standalone --from=json --to=markdown_github+yaml_metadata_block --output="$MDFILE"
+
+  # Remove {.western}
+  #sed -i.bak 's/{.western[^}]*}//g' "$MDFILE"
+
+  # Replace `...` to `---`
+  sed -i.bak 's#^\.\.\.$#---#g' "$MDFILE"
+
+  # Change keywords to tags.
+  sed -i.bak -r "s#^keywords: '?(.*)'?#tags: [\1]#g" "$MDFILE"
+
+  # Change ``` to ~~~
+  sed -i.bak 's#```#~~~#g' "$MDFILE"
+
+  # Fix Table lineBreak
+  sed -i.bak -r 's#LBTOK#<br/>#g' "$MDFILE"
+
+  # Remove temporary file
+  rm "$TFILE"
+  rm "$TFILE.bak"
+  rm "$MDFILE.bak"
+
+done
+
