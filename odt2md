@@ -1,10 +1,7 @@
 #!/bin/bash
 # Script used to convert odt file to markdown file.
 
-#shopt -o -s xtrace
-
 PANDOC="pandoc"
-ODT2HTML="odt2html"
 
 # Function to diaply a warning to the user.
 function alertwarning(){
@@ -52,9 +49,8 @@ def images(key, value, format, meta):
     with open(filename, 'w') as f:
       base64.decode(StringIO(src[start:]), f)
     value[1][0] = filename
-    # Increase image count
-    count=count+1
-    return Image(value[0],value[1])
+    count += 1
+    return Image(value[0], value[1])
 
 if __name__ == "__main__":
   toJSONFilter(images)
@@ -65,12 +61,10 @@ read -r -d '' LINEBREAKS <<'EOF'
 from pandocfilters import walk, toJSONFilter, Str, Table, Plain, BulletList
 
 def replace_linebreaks(key, value, format, meta):
-  # Replace Line break by token
   if key == 'LineBreak':
     return Str('LBTOK')
 
 def replace_linebreaks_from(key, value, format, meta):
-  # Keep last line break.
   if key == 'Plain':
     return Plain(walk(value[:-1], replace_linebreaks, format, meta) + [value[-1]])
 
@@ -90,11 +84,8 @@ from pandocfilters import toJSONFilter, Div, Str, LineBreak
 
 def divstyles(key, value, format, meta):
   if key == 'Div' and len(value[0][1])>0:
-    # Create string similare to {: .text-muted }
     style = '{: ' + ' '.join(['.' + x for x in value[0][1]]) + '}'
-    # Remove attributes from originals
     value[0][1] = []
-    # Try to add our style string to div content.
     if value[1][-1]['t'] == 'Plain':
       value[1][-1]['c'].append(LineBreak())
       value[1][-1]['c'].append(Str(style))
@@ -111,23 +102,15 @@ read -r -d '' WESTERNS <<'EOF'
 from pandocfilters import toJSONFilter, Header, Div, CodeBlock
 
 def filter_attrs(attrs):
-  """Remove western attributes. Also remove `-western` suffix."""
-  return [x.replace('-western', '')
-          for x in attrs
-          if x != 'western']
+  return [x.replace('-western', '') for x in attrs if x != 'western']
 
 def remove_westerns(key, value, format, meta):
-  # Header Int Attr [Inline]
   if key == 'Header' and len(value[1][1]) > 0:
     value[1][1] = filter_attrs(value[1][1])
     return Header(*value)
-
-  # Div Attr [Block]
   if key == 'Div' and len(value[0][1]) > 0:
     value[0][1] = filter_attrs(value[0][1])
     return Div(*value)
-
-  # CodeBlock Attr String
   if key == 'CodeBlock' and len(value[0][1]) > 0:
     value[0][1] = filter_attrs(value[0][1])
     return CodeBlock(*value)
@@ -136,25 +119,18 @@ if __name__ == "__main__":
   toJSONFilter(remove_westerns)
 EOF
 
-
 # Check if pandoc is available
 if ! (command -v "$PANDOC" >/dev/null 2>&1); then
   alertwarning "$PANDOC is missing!"
   exit 2
 fi
 
-# Check if odt2html exists
-if ! (command -v "$ODT2HTML" >/dev/null 2>&1); then
-  alertwarning "$ODT2HTML is missing!"
-  exit 2
-fi
-
 # Loop on every arguments
 for F in "$@"; do
 
-  # Convert file to HTML
+  # Convert file to HTML (replace odt2html with pandoc)
   TFILE="/tmp/$(basename $0).$$.html"
-  "$ODT2HTML" --output="$TFILE" --format=html "$F"
+  "$PANDOC" --from=odt --to=html -o "$TFILE" "$F"
 
   # Fix <li> issues
   lead='^<[ou]l>$'
@@ -170,14 +146,13 @@ for F in "$@"; do
   sed -i.bak "/$lead/,/$tail/{s/<p[^>]*><br\/>//g}" "$TFILE"
   sed -i.bak "/$lead/,/$tail/{s/<p[^>]*>//g}" "$TFILE"
   sed -i.bak "/$lead/,/$tail/{s/<\/p>/<br \/>/g}" "$TFILE"
-  #sed -i.bak "/$lead/,/$tail/{s/<br \/>//g}" "$TFILE"
 
   # Convert <p> to <div> to keep attributes
   sed -i.bak "s/<p /<div /g" "$TFILE"
   sed -i.bak "s/<p>/<div>/g" "$TFILE"
   sed -i.bak "s/<\/p>/<\/div>/g" "$TFILE"
 
-  # Convert file to markdown.
+  # Convert file to markdown
   MDFILE=${1%.*}.md
   "$PANDOC" --from=html --to=json "$TFILE" | \
     python -c "$WESTERNS" | \
@@ -187,25 +162,11 @@ for F in "$@"; do
     python -c "$IMAGES" "${1%.*}" | \
     "$PANDOC" --standalone --from=json --to=markdown_github+yaml_metadata_block --output="$MDFILE"
 
-  # Remove {.western}
-  #sed -i.bak 's/{.western[^}]*}//g' "$MDFILE"
-
-  # Replace `...` to `---`
   sed -i.bak 's#^\.\.\.$#---#g' "$MDFILE"
-
-  # Change keywords to tags.
   sed -i.bak -r "s#^keywords: '?(.*)'?#tags: [\1]#g" "$MDFILE"
-
-  # Change ``` to ~~~
   sed -i.bak 's#```#~~~#g' "$MDFILE"
-
-  # Fix Table lineBreak
   sed -i.bak -r 's#LBTOK#<br/>#g' "$MDFILE"
 
-  # Remove temporary file
-  rm "$TFILE"
-  rm "$TFILE.bak"
-  rm "$MDFILE.bak"
+  rm "$TFILE" "$TFILE.bak" "$MDFILE.bak"
 
 done
-

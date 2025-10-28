@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
+
 COPY odt2md /usr/local/bin/odt2md.sh
 RUN chmod +x /usr/local/bin/odt2md.sh
 
